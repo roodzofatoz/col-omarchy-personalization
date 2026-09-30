@@ -1,0 +1,796 @@
+#!/usr/bin/env python3
+"""Talk to a VGN A75 hall-effect keyboard over hidraw for the user.a75 bar plugin.
+
+The A75 is configured through 64-byte HID feature reports on its vendor
+interface (usage page 0xFFFF). Command numbers and byte layouts were lifted
+from the vendor's web-hub bundle (see reference/ in the plugin directory).
+Everything prints JSON so the QML side never parses free text.
+"""
+
+import argparse
+import errno
+import fcntl
+import glob
+import json
+import os
+import sys
+import time
+
+VENDOR_ID = 0x3151
+PRODUCT_IDS = {0x4015, 0x4011}
+VENDOR_USAGE_PAGE = 0xFFFF
+
+REPORT_LEN = 65            # report id 0 + 64 payload bytes
+SETTLE = 0.01              # vendor helper waits ~10 ms before reading a reply
+BIG_DELAY = 0.5            # after profile / preset changes
+RECORD_DELAY = 0.5         # after each per-key trigger record (firmware saves to flash)
+
+CMD_GET_REV = 128
+CMD_SET_PROFILE = 5
+CMD_GET_PROFILE = 133
+CMD_SET_REPORT = 4
+CMD_GET_REPORT = 132
+CMD_SET_KEY_MAGNETISM_MODE = 29
+CMD_GET_KEY_MAGNETISM_MODE = 157
+CMD_SET_MAGNETISM_MODE = 26
+CMD_SET_MAGNETISM_REPORT = 27
+
+PRESETS = ["comfort", "sensitive", "gaming", "custom"]
+RATE_CODES = {1: 1000, 2: 500, 4: 250, 8: 125}
+
+TRAVEL_MIN = 1             # 0.1 mm
+TRAVEL_MAX = 40            # 4.0 mm
+DEADZONE_MAX = 10          # 1.0 mm
+
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "omarchy-a75")
+
+
+# ---------------------------------------------------------------- framing
+
+def new_report(cmd):
+    report = bytearray(64)
+    report[0] = cmd
+    return report
+
+
+def finalize(report, checksum="bit7"):
+    """Apply the vendor checksum and return immutable bytes."""
+    out = bytearray(report)
+    if checksum == "bit7":
+        out[7] = 255 - (sum(out[0:7]) & 255)
+    elif checksum == "bit8":
+        out[8] = 255 - (sum(out[0:8]) & 255)
+    elif checksum != "none":
+        raise ValueError("unknown checksum type %r" % checksum)
+    return bytes(out)
+
+
+# ---------------------------------------------------- report descriptors
+
+def usage_pages(descriptor):
+    """Every Usage Page declared in a HID report descriptor.
+
+    Short items only: prefix byte = tag(4) | type(2) | size(2); size 3 means 4
+    bytes. Usage Page is a global item (type 1) with tag 0.
+    """
+    pages = set()
+    i = 0
+    n = len(descriptor)
+    while i < n:
+        prefix = descriptor[i]
+        if prefix == 0xFE:                     # long item: skip
+            length = descriptor[i + 1] if i + 1 < n else 0
+            i += 3 + length
+            continue
+        size = prefix & 3
+        if size == 3:
+            size = 4
+        item_type = (prefix >> 2) & 3
+        tag = prefix >> 4
+        data = descriptor[i + 1:i + 1 + size]
+        if item_type == 1 and tag == 0 and data:
+            pages.add(int.from_bytes(data, "little"))
+        i += 1 + size
+    return pages
+
+
+# ------------------------------------------------------------- discovery
+
+def _hid_id(device_dir):
+    try:
+        with open(os.path.join(device_dir, "uevent")) as handle:
+            for line in handle:
+                if line.startswith("HID_ID="):
+                    parts = line.strip().split("=", 1)[1].split(":")
+                    return int(parts[1], 16), int(parts[2], 16)
+    except (OSError, ValueError, IndexError):
+        pass
+    return None, None
+
+
+def candidates(sys_root="/sys/class/hidraw", dev_root="/dev"):
+    """hidraw nodes that belong to an A75 and expose the vendor usage page."""
+    found = []
+    for node in sorted(glob.glob(os.path.join(sys_root, "hidraw*"))):
+        device_dir = os.path.join(node, "device")
+        vendor, product = _hid_id(device_dir)
+        if vendor != VENDOR_ID or product not in PRODUCT_IDS:
+            continue
+        try:
+            with open(os.path.join(device_dir, "report_descriptor"), "rb") as handle:
+                descriptor = handle.read()
+        except OSError:
+            continue
+        if VENDOR_USAGE_PAGE not in usage_pages(descriptor):
+            continue
+        found.append({"path": os.path.join(dev_root, os.path.basename(node)), "product": product})
+    return found
+
+
+# ------------------------------------------------------------ transports
+
+def _ioc(direction, letter, nr, size):
+    return (direction << 30) | (size << 16) | (ord(letter) << 8) | nr
+
+
+_IOC_RW = 3
+
+
+def _set_feature(length):
+    return _ioc(_IOC_RW, "H", 0x06, length)
+
+
+def _get_feature(length):
+    return _ioc(_IOC_RW, "H", 0x07, length)
+
+
+class HidrawTransport:
+    """One feature-report exchange at a time on the vendor interface."""
+
+    def __init__(self, path):
+        self.path = path
+        self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def exchange(self, report, expect, settle=SETTLE):
+        out = bytearray(REPORT_LEN)
+        out[1:] = report
+        fcntl.ioctl(self.fd, _set_feature(REPORT_LEN), bytes(out))
+        time.sleep(settle)
+        back = bytearray(REPORT_LEN)
+        fcntl.ioctl(self.fd, _get_feature(REPORT_LEN), back)
+        return bytes(back[1:])
+
+    def write_only(self, report):
+        out = bytearray(REPORT_LEN)
+        out[1:] = report
+        fcntl.ioctl(self.fd, _set_feature(REPORT_LEN), bytes(out))
+
+    def read_input(self, timeout):
+        """One unsolicited input report from the vendor interface, or None."""
+        import select
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if not ready:
+            return None
+        try:
+            return os.read(self.fd, REPORT_LEN)
+        except BlockingIOError:
+            return None
+
+
+class FakeTransport:
+    """Test double: returns canned replies (or raises canned exceptions)."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.sent = []
+        self.path = "/dev/fake"
+
+    def close(self):
+        pass
+
+    def exchange(self, report, expect, settle=0):
+        self.sent.append(bytes(report))
+        item = self.replies.pop(0) if self.replies else bytes(64)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def write_only(self, report):
+        self.sent.append(bytes(report))
+        if self.replies and isinstance(self.replies[0], BaseException):
+            raise self.replies.pop(0)
+
+    def read_input(self, timeout):
+        item = self.replies.pop(0) if self.replies else None
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def probe(transport, attempts=3):
+    """GET_REV round trip. Returns the raw firmware word or None."""
+    report = finalize(new_report(CMD_GET_REV), "bit7")
+    settle = SETTLE
+    for _ in range(attempts):
+        try:
+            reply = transport.exchange(report, CMD_GET_REV, settle=settle)
+        except OSError as exc:
+            if exc.errno == errno.EPIPE:
+                return None            # not the interface that answers vendor commands
+            raise
+        if reply and reply[0] == CMD_GET_REV:
+            return reply[1] | (reply[2] << 8)
+        settle += 0.03
+    return None
+
+
+def open_keyboard(sys_root="/sys/class/hidraw", dev_root="/dev"):
+    """Find and verify the A75. Returns (transport, info)."""
+    info = {"present": False, "path": None, "product": None, "permissionError": False, "stalled": False,
+            "held": False, "firmwareRaw": None}
+    for cand in candidates(sys_root, dev_root):
+        try:
+            transport = HidrawTransport(cand["path"])
+        except PermissionError:
+            info.update(present=True, permissionError=True, path=cand["path"], product=cand["product"])
+            continue
+        except OSError:
+            continue
+        try:
+            firmware = probe(transport)
+        except PermissionError:
+            transport.close()
+            info.update(present=True, permissionError=True, path=cand["path"], product=cand["product"])
+            continue
+        except OSError as exc:
+            transport.close()
+            if exc.errno in (errno.ENODEV, errno.EIO, errno.ENOENT):
+                continue
+            if exc.errno in (errno.EPROTO, errno.ETIMEDOUT):
+                # The vendor pipe stalls after a badly timed write; only a
+                # re-enumeration clears it.
+                info.update(present=True, stalled=True, path=cand["path"], product=cand["product"],
+                            error="USB config pipe stalled; unplug and replug the keyboard")
+                continue
+            raise
+        if firmware is None:
+            transport.close()
+            continue
+        info.update(present=True, path=cand["path"], product=cand["product"], firmwareRaw=firmware)
+        return transport, info
+    return None, info
+
+
+# --------------------------------------------------------------- keyboard
+
+def format_firmware(raw):
+    """The vendor hub shows the raw GET_REV word as a hex string (0x0112 → "112")."""
+    return "%x" % raw
+
+
+class Keyboard:
+    """Vendor commands over one transport. Every method returns decoded data or None."""
+
+    def __init__(self, transport):
+        self.transport = transport
+        self._profile = None
+
+    def _ask(self, cmd, params=(), checksum="bit7", settle=SETTLE):
+        report = new_report(cmd)
+        for i, value in enumerate(params, start=1):
+            report[i] = value & 0xFF
+        reply = self.transport.exchange(finalize(report, checksum), cmd, settle=settle)
+        if not reply or reply[0] != cmd:
+            return None
+        return reply
+
+    def _tell(self, cmd, params=(), checksum="bit7"):
+        report = new_report(cmd)
+        for i, value in enumerate(params, start=1):
+            report[i] = value & 0xFF
+        self.transport.write_only(finalize(report, checksum))
+
+    def firmware(self):
+        reply = self._ask(CMD_GET_REV)
+        if reply is None:
+            return None
+        raw = reply[1] | (reply[2] << 8)
+        return {"raw": raw, "text": format_firmware(raw)}
+
+    def profile(self):
+        reply = self._ask(CMD_GET_PROFILE)
+        if reply is None:
+            return None
+        self._profile = reply[1]
+        return reply[1]
+
+    def preset(self):
+        reply = self._ask(CMD_GET_KEY_MAGNETISM_MODE)
+        if reply is None:
+            return None
+        mode = PRESETS[reply[1]] if reply[1] < len(PRESETS) else "custom"
+        return {"mode": mode, "keyboardDisabled": reply[2] == 1}
+
+    def report_rate(self):
+        if self._profile is None:
+            self.profile()
+        reply = self._ask(CMD_GET_REPORT, [self._profile or 0])
+        if reply is None:
+            return None
+        return RATE_CODES.get(reply[2])
+
+    def set_preset(self, name, keyboard_disabled=False):
+        if name not in PRESETS:
+            raise ValueError("unknown preset %r" % name)
+        self._tell(CMD_SET_KEY_MAGNETISM_MODE, [PRESETS.index(name), 1 if keyboard_disabled else 0])
+        time.sleep(BIG_DELAY)
+        return self.preset()
+
+    def set_profile(self, index):
+        if not 0 <= index <= 7:
+            raise ValueError("profile out of range")
+        self._tell(CMD_SET_PROFILE, [index])
+        time.sleep(BIG_DELAY)
+        return self.profile()
+
+    def set_report_rate(self, hz):
+        codes = {v: k for k, v in RATE_CODES.items()}
+        if hz not in codes:
+            raise ValueError("unsupported rate %r" % hz)
+        if self._profile is None:
+            self.profile()
+        self._tell(CMD_SET_REPORT, [self._profile or 0, codes[hz]])
+        time.sleep(BIG_DELAY)
+        return self.report_rate()
+
+    def close(self):
+        self.transport.close()
+        release_device_lock()
+
+    def send_trigger(self, record):
+        self.transport.write_only(record)
+        time.sleep(RECORD_DELAY)
+
+    def set_depth_report(self, enabled):
+        self._tell(CMD_SET_MAGNETISM_REPORT, [1 if enabled else 0])
+
+    def status(self):
+        out = {"profile": self.profile()}
+        preset = self.preset()
+        out["preset"] = preset["mode"] if preset else None
+        out["keyboardDisabled"] = bool(preset and preset["keyboardDisabled"])
+        out["reportRate"] = self.report_rate()
+        return out
+
+
+# ------------------------------------------------------- trigger records
+
+def default_trigger():
+    return {"actuation": 20, "release": 20, "rt": False, "rtPress": 3, "rtRelease": 3, "deadzoneBottom": 0}
+
+
+def _clamp_raw(value, lo, hi):
+    try:
+        raw = int(round(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        raw = lo
+    return max(lo, min(hi, raw))
+
+
+def normalize_trigger(t):
+    """Coerce a trigger dict into valid raw values. Returns (dict, adjusted)."""
+    base = default_trigger()
+    if not isinstance(t, dict):
+        t = {}
+    src = dict(base, **{str(k): v for k, v in t.items()})
+    out = {
+        "actuation": _clamp_raw(src["actuation"], TRAVEL_MIN, TRAVEL_MAX),
+        "release": _clamp_raw(src["release"], TRAVEL_MIN, TRAVEL_MAX),
+        "rt": bool(src["rt"]) and str(src["rt"]).lower() not in ("false", "0", "off", ""),
+        "rtPress": _clamp_raw(src["rtPress"], TRAVEL_MIN, TRAVEL_MAX),
+        "rtRelease": _clamp_raw(src["rtRelease"], TRAVEL_MIN, TRAVEL_MAX),
+        "deadzoneBottom": _clamp_raw(src["deadzoneBottom"], 0, DEADZONE_MAX),
+    }
+    adjusted = any(out[k] != src[k] for k in ("actuation", "release", "rtPress", "rtRelease", "deadzoneBottom"))
+    if out["release"] > out["actuation"]:
+        out["release"] = out["actuation"]
+        adjusted = True
+    return out, adjusted
+
+
+def trigger_record(profile, t, slot=None):
+    """SET_MAGNETISM_MODE (26) record, byte layout from the vendor's setMagnetismMode."""
+    t, _ = normalize_trigger(t)
+    r = new_report(CMD_SET_MAGNETISM_MODE)
+    r[1] = profile & 0xFF
+    r[2] = 1
+    r[3] = 0x80 if t["rt"] else 0
+    r[4] = t["actuation"]
+    r[5] = 1 if slot is None else 0
+    r[6] = 0 if slot is None else (slot & 0xFF)
+    r[8] = t["release"]
+    r[9] = t["rtPress"] if t["rt"] else 0
+    r[10] = t["rtRelease"] if t["rt"] else 0
+    dz = t["deadzoneBottom"]
+    r[25] = 0 if dz == 0 else dz - 1
+    return finalize(r, "bit7")
+
+
+# ------------------------------------------------------------ state files
+
+def profile_path(index):
+    return os.path.join(STATE_DIR, "profile-%d.json" % index)
+
+
+def load_profile(index):
+    fresh = {"version": 1, "synced": False, "default": default_trigger(), "keys": {}, "warning": None}
+    try:
+        with open(profile_path(index)) as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return fresh
+    except (OSError, ValueError) as exc:
+        fresh["warning"] = "profile file unreadable (%s); starting fresh" % exc.__class__.__name__
+        return fresh
+    if not isinstance(data, dict) or not isinstance(data.get("keys"), dict):
+        fresh["warning"] = "profile file has an unexpected shape; starting fresh"
+        return fresh
+    if not isinstance(data.get("default"), dict) or any(not isinstance(v, dict) for v in data["keys"].values()):
+        fresh["warning"] = "profile file has an unexpected shape; starting fresh"
+        return fresh
+
+    def sane(t):
+        import math
+        for v in t.values():
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)) and math.isfinite(v):
+                continue
+            if isinstance(v, str) and v.lower() in ("true", "false", "on", "off"):
+                continue
+            return False
+        return True
+
+    if not sane(data["default"]) or any(not sane(v) for v in data["keys"].values()):
+        fresh["warning"] = "profile file has bad values; starting fresh"
+        return fresh
+    try:
+        default, _ = normalize_trigger(data["default"])
+        keys = {str(k): normalize_trigger(v)[0] for k, v in data["keys"].items()}
+    except (TypeError, ValueError, OverflowError) as exc:
+        fresh["warning"] = "profile file has bad values (%s); starting fresh" % exc.__class__.__name__
+        return fresh
+    return {"version": 1, "synced": bool(data.get("synced", False)), "default": default, "keys": keys, "warning": None}
+
+
+def save_profile(index, data):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = profile_path(index) + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(data, handle, indent=1, sort_keys=True)
+    os.replace(tmp, profile_path(index))
+
+
+# --------------------------------------------------------------------- cli
+
+def emit(obj):
+    print(json.dumps(obj))
+
+
+# ---- one process on the wire at a time -------------------------------
+
+LOCK_TIMEOUT = 5.0
+_lock_fd = None
+
+
+def device_lock_path():
+    return os.path.join(STATE_DIR, "device.lock")
+
+
+def hub_hold_path():
+    """Written by omarchy-a75-hub while the vendor hub owns the keyboard."""
+    return os.path.join(STATE_DIR, "hub.hold")
+
+
+def acquire_device_lock():
+    """flock so the engine, the depth watcher and manual CLI runs never interleave on the wire."""
+    global _lock_fd
+    os.makedirs(STATE_DIR, exist_ok=True)
+    fd = os.open(device_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.time() + LOCK_TIMEOUT
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_fd = fd
+            return
+        except BlockingIOError:
+            if time.time() >= deadline:
+                os.close(fd)
+                raise RuntimeError("keyboard busy: another omarchy-a75 command holds the device")
+            time.sleep(0.05)
+
+
+def release_device_lock():
+    global _lock_fd
+    if _lock_fd is not None:
+        try:
+            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            os.close(_lock_fd)
+        except OSError:
+            pass
+        _lock_fd = None
+
+
+def with_keyboard(args):
+    """Open, probe, and hand back (keyboard, info). info is printable as-is when keyboard is None."""
+    if os.path.exists(hub_hold_path()):
+        # The vendor hub (firmware flow) owns the device; stay off the wire.
+        present = bool(candidates(args.sys_root, args.dev_root))
+        return None, {"present": present, "path": None, "product": None, "permissionError": False,
+                      "stalled": False, "held": True, "firmwareRaw": None, "firmware": None,
+                      "error": "vendor hub is using the keyboard" if not present else None}
+    acquire_device_lock()
+    transport, info = open_keyboard(args.sys_root, args.dev_root)
+    info["firmware"] = format_firmware(info["firmwareRaw"]) if info.get("firmwareRaw") is not None else None
+    if transport is None:
+        release_device_lock()
+        return None, info
+    return Keyboard(transport), info
+
+
+def cmd_status(args):
+    kb, info = with_keyboard(args)
+    if kb is None:
+        emit(info)
+        return 0
+    try:
+        info.update(kb.status())
+    except OSError as exc:
+        info["error"] = str(exc)
+    finally:
+        kb.close()
+    emit(info)
+    return 0
+
+
+def _finish(kb, info):
+    try:
+        info.update(kb.status())
+    finally:
+        kb.close()
+    emit(info)
+    return 0
+
+
+def cmd_preset(args):
+    kb, info = with_keyboard(args)
+    if kb is None:
+        emit(info)
+        return 1
+    kb.set_preset(args.name, args.disable_keyboard)
+    return _finish(kb, info)
+
+
+def cmd_profile(args):
+    kb, info = with_keyboard(args)
+    if kb is None:
+        emit(info)
+        return 1
+    kb.set_profile(args.index)
+    return _finish(kb, info)
+
+
+def cmd_rate(args):
+    kb, info = with_keyboard(args)
+    if kb is None:
+        emit(info)
+        return 1
+    kb.set_report_rate(args.hz)
+    return _finish(kb, info)
+
+
+def mm_to_raw(value):
+    return int(round(float(value) * 10))
+
+
+def apply_trigger_args(current, args):
+    """Overlay the CLI's optional fields on a trigger dict."""
+    t = dict(current)
+    if args.actuation is not None:
+        t["actuation"] = mm_to_raw(args.actuation)
+    if args.release is not None:
+        t["release"] = mm_to_raw(args.release)
+    if args.rt is not None:
+        t["rt"] = args.rt == "on"
+    if args.rt_press is not None:
+        t["rtPress"] = mm_to_raw(args.rt_press)
+    if args.rt_release is not None:
+        t["rtRelease"] = mm_to_raw(args.rt_release)
+    if args.deadzone_bottom is not None:
+        t["deadzoneBottom"] = mm_to_raw(args.deadzone_bottom)
+    return normalize_trigger(t)
+
+
+def cmd_trigger(args):
+    kb, info = with_keyboard(args)
+    if kb is None:
+        emit(info)
+        return 1
+    try:
+        profile = args.profile if args.profile is not None else (kb.profile() or 0)
+        state = load_profile(profile)
+        reports = []
+        adjusted = False
+        if args.all:
+            t, adjusted = apply_trigger_args(state["default"], args)
+            state["default"] = t
+            state["keys"] = {}
+            reports.append(trigger_record(profile, t, None))
+        else:
+            slots = [int(s) for s in args.keys.split(",") if s.strip() != ""]
+            for slot in slots:
+                base = state["keys"].get(str(slot), state["default"])
+                t, adj = apply_trigger_args(base, args)
+                adjusted = adjusted or adj
+                state["keys"][str(slot)] = t
+                reports.append(trigger_record(profile, t, slot))
+        written = 0
+        if not args.dry_run:
+            if (kb.preset() or {}).get("mode") != "custom":
+                kb.set_preset("custom")
+            for rec in reports:
+                kb.send_trigger(rec)
+                written += 1
+            time.sleep(BIG_DELAY)      # let the firmware finish saving before the next GET
+            state["synced"] = True
+        save_profile(profile, state)
+        info.update(kb.status())
+        info["profileState"] = state
+        info["written"] = written
+        info["adjusted"] = adjusted
+        if args.dry_run:
+            info["reports"] = [rec.hex() for rec in reports]
+    finally:
+        kb.close()
+    emit(info)
+    return 0
+
+
+def cmd_profile_state(args):
+    kb, info = with_keyboard(args)
+    if kb is None:
+        emit(info)
+        return 1
+    try:
+        info.update(kb.status())
+        index = args.index if args.index is not None else (info.get("profile") or 0)
+        info["profileState"] = load_profile(index)
+    finally:
+        kb.close()
+    emit(info)
+    return 0
+
+
+# ------------------------------------------------------------ depth stream
+
+DEPTH_REPORT_ID = 0x05
+
+
+def parse_depth_frame(frame):
+    """Vendor event report [0x05][0x1b][travel 0.1 mm][sensor level]; no key id (reference/depth-frames.md)."""
+    if not frame or frame[0] != DEPTH_REPORT_ID or len(frame) < 4 or frame[1] != CMD_SET_MAGNETISM_REPORT:
+        return None
+    return {"travel": frame[2], "level": frame[3], "raw": frame.hex()}
+
+
+def open_event_readers(command_path, sys_root, dev_root):
+    """Read-only handles on the A75's other vendor-page nodes: events arrive there, not on the command node."""
+    readers = []
+    for cand in candidates(sys_root, dev_root):
+        if cand["path"] == command_path:
+            continue
+        try:
+            readers.append(os.open(cand["path"], os.O_RDONLY | os.O_NONBLOCK))
+        except OSError:
+            continue
+    return readers
+
+
+def cmd_depth(args):
+    kb, info = with_keyboard(args)
+    if kb is None:
+        emit(info)
+        return 1
+    try:
+        if args.action in ("start", "stop"):
+            kb.set_depth_report(args.action == "start")
+            info["depthReporting"] = args.action == "start"
+            emit(info)
+            return 0
+        import select
+        readers = open_event_readers(kb.transport.path, args.sys_root, args.dev_root)
+        if not readers:
+            emit({"error": "no event interface found next to " + str(kb.transport.path)})
+            return 1
+        deadline = time.time() + args.seconds if args.seconds else None
+        while deadline is None or time.time() < deadline:
+            ready, _, _ = select.select(readers, [], [], 0.5)
+            for fd in ready:
+                try:
+                    frame = os.read(fd, REPORT_LEN)
+                except BlockingIOError:
+                    continue
+                if args.raw:
+                    emit({"raw": frame.hex()})
+                else:
+                    parsed = parse_depth_frame(frame)
+                    if parsed:
+                        emit(parsed)
+            sys.stdout.flush()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for fd in locals().get("readers", []):
+            os.close(fd)
+        kb.close()
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="omarchy-a75")
+    parser.add_argument("--sys-root", default="/sys/class/hidraw", help=argparse.SUPPRESS)
+    parser.add_argument("--dev-root", default="/dev", help=argparse.SUPPRESS)
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status", help="device presence, firmware, profile, preset").set_defaults(func=cmd_status)
+    p = sub.add_parser("preset", help="select a trigger preset")
+    p.add_argument("name", choices=PRESETS)
+    p.add_argument("--disable-keyboard", action="store_true")
+    p.set_defaults(func=cmd_preset)
+    p = sub.add_parser("profile", help="select the active profile")
+    p.add_argument("index", type=int)
+    p.set_defaults(func=cmd_profile)
+    p = sub.add_parser("rate", help="set the polling rate")
+    p.add_argument("hz", type=int, choices=sorted(RATE_CODES.values()))
+    p.set_defaults(func=cmd_rate)
+    p = sub.add_parser("trigger", help="write actuation / rapid-trigger settings")
+    p.add_argument("--profile", type=int)
+    target = p.add_mutually_exclusive_group(required=True)
+    target.add_argument("--all", action="store_true")
+    target.add_argument("--keys", help="comma-separated key slots")
+    p.add_argument("--actuation", type=float, help="mm")
+    p.add_argument("--release", type=float, help="mm")
+    p.add_argument("--rt", choices=["on", "off"])
+    p.add_argument("--rt-press", type=float, help="mm")
+    p.add_argument("--rt-release", type=float, help="mm")
+    p.add_argument("--deadzone-bottom", type=float, help="mm")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_trigger)
+    p = sub.add_parser("profile-state", help="print the stored per-key settings")
+    p.add_argument("index", type=int, nargs="?")
+    p.set_defaults(func=cmd_profile_state)
+    p = sub.add_parser("depth", help="key depth reporting")
+    p.add_argument("action", choices=["start", "stop", "watch"])
+    p.add_argument("--raw", action="store_true")
+    p.add_argument("--seconds", type=float, default=0)
+    p.set_defaults(func=cmd_depth)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except (OSError, ValueError, RuntimeError) as exc:
+        emit({"error": str(exc), "errno": getattr(exc, "errno", None)})
+        return 1
+    finally:
+        release_device_lock()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

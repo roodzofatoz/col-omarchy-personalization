@@ -1,0 +1,1040 @@
+#!/usr/bin/env python3
+"""omarchy-torrent: helper for the user.torrent Omarchy shell plugin.
+
+Wraps a per-user transmission-daemon (run as the transient systemd user unit
+`omarchy-torrent-daemon`, config under ~/.local/state/omarchy-torrent/daemon)
+behind small JSON-printing subcommands the QML engine calls, and implements
+streaming: `stream <id> <file>` starts a local HTTP range server (its own
+`omarchy-torrent-stream-*` unit) that serves a file straight out of the
+torrent's download directory while it is still downloading, holding every
+read until the pieces behind it have arrived. Seeking sets Transmission's
+`sequential_download_from_piece`, so the player can jump ahead.
+
+Every subcommand prints one JSON object on stdout.
+"""
+
+import atexit
+import base64
+import http.server
+import json
+import mimetypes
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HOME = os.path.expanduser("~")
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local", "state")), "omarchy-torrent")
+DAEMON_DIR = os.path.join(STATE, "daemon")
+STREAMS_DIR = os.path.join(STATE, "streams")
+CONFIG_FILE = os.path.join(STATE, "config.json")
+LOG_DIR = os.path.join(STATE, "logs")
+DAEMON_UNIT = "omarchy-torrent-daemon"
+SELF = os.path.realpath(__file__)
+
+DEFAULT_CONFIG = {
+    "downloadDir": os.path.join(HOME, "Downloads", "Torrents"),
+    "rpcPort": 9091,
+    "seedRatioLimit": 2.0,      # 0 = seed forever
+    "player": "mpv",            # command used to play a stream URL
+}
+
+MEDIA_EXT = {
+    "mp4", "mkv", "avi", "mov", "webm", "m4v", "ts", "m2ts", "wmv", "flv", "mpg", "mpeg", "ogv", "3gp",
+    "mp3", "flac", "m4a", "ogg", "oga", "opus", "wav", "aac", "wma", "aiff", "ape", "dsf",
+}
+
+STATUS_NAMES = {0: "paused", 1: "checking", 2: "checking", 3: "queued", 4: "downloading", 5: "queued", 6: "seeding"}
+
+
+# ----------------------------------------------------------------- helpers
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def fail(msg, code=1):
+    out({"ok": False, "error": str(msg)})
+    sys.exit(code)
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if v is not None and v != "":
+                    cfg[k] = v
+    except (OSError, ValueError):
+        pass
+    cfg["downloadDir"] = os.path.expanduser(str(cfg["downloadDir"]).replace("$HOME", HOME))
+    try:
+        cfg["rpcPort"] = int(cfg["rpcPort"])
+    except (TypeError, ValueError):
+        cfg["rpcPort"] = DEFAULT_CONFIG["rpcPort"]
+    try:
+        cfg["seedRatioLimit"] = float(cfg["seedRatioLimit"])
+    except (TypeError, ValueError):
+        cfg["seedRatioLimit"] = DEFAULT_CONFIG["seedRatioLimit"]
+    return cfg
+
+
+def save_config(cfg):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG_FILE)
+
+
+def unit_active(unit):
+    r = subprocess.run(["systemctl", "--user", "is-active", unit], capture_output=True, text=True)
+    return r.stdout.strip() == "active"
+
+
+def unit_stop(unit):
+    subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True)
+    subprocess.run(["systemctl", "--user", "reset-failed", unit], capture_output=True)
+
+
+def is_media(name):
+    return name.rsplit(".", 1)[-1].lower() in MEDIA_EXT if "." in name else False
+
+
+def human_size(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%d %s" if unit == "B" else "%.1f %s") % (n, unit)
+        n /= 1024
+    return "%.1f TB" % n
+
+
+# --------------------------------------------------------------------- RPC
+
+class RpcError(Exception):
+    pass
+
+
+class Rpc:
+    def __init__(self, port):
+        self.url = "http://127.0.0.1:%d/transmission/rpc" % port
+        self.sid = ""
+
+    def call(self, method, params=None, timeout=8):
+        body = json.dumps({"jsonrpc": "2.0", "method": method, "params": params or {}, "id": 1}).encode()
+        for _attempt in range(3):
+            req = urllib.request.Request(self.url, body, {
+                "Content-Type": "application/json",
+                "X-Transmission-Session-Id": self.sid,
+            })
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    raw = r.read()
+            except urllib.error.HTTPError as e:
+                if e.code == 409:
+                    self.sid = e.headers.get("X-Transmission-Session-Id", "")
+                    continue
+                raise RpcError("rpc http %d" % e.code)
+            except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
+                raise RpcError("daemon unreachable: %s" % getattr(e, "reason", e))
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                raise RpcError("unreadable rpc reply")
+            if "error" in data:
+                err = data["error"] or {}
+                extra = (err.get("data") or {}).get("error_string") or ""
+                raise RpcError((err.get("message") or "rpc error") + (": " + extra if extra else ""))
+            return data.get("result", {}) or {}
+        raise RpcError("rpc session id handshake failed")
+
+    def alive(self):
+        try:
+            self.call("session_get", {"fields": ["version"]}, timeout=2)
+            return True
+        except RpcError:
+            return False
+
+
+# ------------------------------------------------------------------ daemon
+
+def daemon_settings_path():
+    return os.path.join(DAEMON_DIR, "settings.json")
+
+
+def seed_daemon_settings(cfg):
+    """Create settings.json once, from the daemon's own defaults, bound to localhost."""
+    path = daemon_settings_path()
+    os.makedirs(DAEMON_DIR, exist_ok=True)
+    settings = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                settings = json.load(f)
+        except (OSError, ValueError):
+            settings = {}
+    if not settings:
+        r = subprocess.run(["transmission-daemon", "-g", DAEMON_DIR, "--dump-settings"], capture_output=True, text=True)
+        try:
+            settings = json.loads(r.stderr or r.stdout)
+        except ValueError:
+            settings = {}
+    settings.update({
+        "rpc_enabled": True,
+        "rpc_bind_address": "127.0.0.1",
+        "rpc_port": cfg["rpcPort"],
+        "rpc_authentication_required": False,
+        "rpc_whitelist": "127.0.0.1,::1",
+        "rpc_whitelist_enabled": True,
+        "rpc_host_whitelist_enabled": False,
+        "download_dir": cfg["downloadDir"],
+        "incomplete_dir_enabled": False,
+        "rename_partial_files": False,
+        "preallocation": 1,
+        "cache_size_mib": 4,
+        "ratio_limit": cfg["seedRatioLimit"] if cfg["seedRatioLimit"] > 0 else 2.0,
+        "ratio_limit_enabled": cfg["seedRatioLimit"] > 0,
+        "start_added_torrents": True,
+        "umask": "022",
+    })
+    with open(path, "w") as f:
+        json.dump(settings, f, indent=4)
+
+
+def apply_session(rpc, cfg):
+    try:
+        rpc.call("session_set", {
+            "download_dir": cfg["downloadDir"],
+            "incomplete_dir_enabled": False,
+            "rename_partial_files": False,
+            "seed_ratio_limit": cfg["seedRatioLimit"] if cfg["seedRatioLimit"] > 0 else 2.0,
+            "seed_ratio_limited": cfg["seedRatioLimit"] > 0,
+        })
+    except RpcError:
+        pass
+
+
+def start_daemon(cfg):
+    seed_daemon_settings(cfg)
+    os.makedirs(cfg["downloadDir"], exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    unit_stop(DAEMON_UNIT)
+    subprocess.run([
+        "systemd-run", "--user", "--quiet", "--collect", "--unit=" + DAEMON_UNIT,
+        "--description=Omarchy torrent daemon (transmission)",
+        "-p", "StandardOutput=append:" + os.path.join(LOG_DIR, "daemon.log"),
+        "-p", "StandardError=append:" + os.path.join(LOG_DIR, "daemon.log"),
+        "transmission-daemon", "-f", "-g", DAEMON_DIR, "--log-level=error",
+    ], capture_output=True)
+
+
+def ensure_daemon(cfg, wait=6.0):
+    """Start the daemon if needed; return (rpc, state) where state is running|starting|down."""
+    rpc = Rpc(cfg["rpcPort"])
+    if rpc.alive():
+        return rpc, "running"
+    if not shutil.which("transmission-daemon"):
+        return rpc, "missing"
+    if not unit_active(DAEMON_UNIT):
+        start_daemon(cfg)
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if rpc.alive():
+            apply_session(rpc, cfg)
+            return rpc, "running"
+        time.sleep(0.25)
+    return rpc, ("starting" if unit_active(DAEMON_UNIT) else "down")
+
+
+# ----------------------------------------------------------------- streams
+
+def stream_marker(tid, fidx):
+    return os.path.join(STREAMS_DIR, "%s-%s.json" % (tid, fidx))
+
+
+def stream_unit(tid, fidx):
+    return "omarchy-torrent-stream-%s-%s" % (tid, fidx)
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def list_streams():
+    streams = []
+    if not os.path.isdir(STREAMS_DIR):
+        return streams
+    for name in sorted(os.listdir(STREAMS_DIR)):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(STREAMS_DIR, name)
+        try:
+            with open(path) as f:
+                m = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not pid_alive(m.get("pid")):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            continue
+        streams.append(m)
+    return streams
+
+
+# --------------------------------------------------------------- torrents
+
+TORRENT_FIELDS = [
+    "id", "name", "hash_string", "status", "percent_done", "total_size", "size_when_done", "left_until_done",
+    "rate_download", "rate_upload", "eta", "peers_connected", "peers_sending_to_us", "peers_getting_from_us",
+    "error", "error_string", "sequential_download", "sequential_download_from_piece", "files", "file_stats",
+    "download_dir", "added_date", "upload_ratio", "metadata_percent_complete", "is_finished", "piece_size",
+    "piece_count", "magnet_link", "uploaded_ever", "downloaded_ever", "is_stalled",
+]
+
+
+def shape_torrent(t, streams):
+    files = []
+    stats = t.get("file_stats") or []
+    for i, f in enumerate(t.get("files") or []):
+        st = stats[i] if i < len(stats) else {}
+        length = int(f.get("length") or 0)
+        done = int(f.get("bytes_completed") or 0)
+        files.append({
+            "index": i,
+            "name": f.get("name") or "",
+            "base": os.path.basename(f.get("name") or ""),
+            "length": length,
+            "completed": done,
+            "percent": (done / length) if length else 0.0,
+            "wanted": bool(st.get("wanted", True)),
+            "priority": int(st.get("priority", 0)),
+            "media": is_media(f.get("name") or ""),
+            "streaming": any(s.get("torrentId") == t.get("id") and s.get("fileIndex") == i for s in streams),
+        })
+    status = int(t.get("status", 0))
+    meta = float(t.get("metadata_percent_complete") or 0)
+    if status == 0:
+        state = "done" if t.get("is_finished") or float(t.get("percent_done") or 0) >= 1.0 else "paused"
+    elif status == 4 and meta < 1.0:
+        state = "metadata"
+    else:
+        state = STATUS_NAMES.get(status, "unknown")
+    if int(t.get("error") or 0):
+        state = "error"
+    media = [f for f in files if f["media"] and f["wanted"]]
+    best = max(media, key=lambda f: f["length"])["index"] if media else -1
+    return {
+        "id": t.get("id"),
+        "hash": t.get("hash_string"),
+        "name": t.get("name") or "",
+        "state": state,
+        "status": status,
+        "percent": float(t.get("percent_done") or 0),
+        "metadata": meta,
+        "size": int(t.get("size_when_done") or t.get("total_size") or 0),
+        "totalSize": int(t.get("total_size") or 0),
+        "left": int(t.get("left_until_done") or 0),
+        "rateDown": int(t.get("rate_download") or 0),
+        "rateUp": int(t.get("rate_upload") or 0),
+        "eta": int(t.get("eta") if t.get("eta") is not None else -1),
+        "peers": int(t.get("peers_connected") or 0),
+        "seeds": int(t.get("peers_sending_to_us") or 0),
+        "error": t.get("error_string") or "",
+        "sequential": bool(t.get("sequential_download")),
+        "ratio": float(t.get("upload_ratio") or 0),
+        "downloadDir": t.get("download_dir") or "",
+        "addedDate": int(t.get("added_date") or 0),
+        "stalled": bool(t.get("is_stalled")),
+        "magnet": t.get("magnet_link") or "",
+        "files": files,
+        "fileCount": len(files),
+        "bestMedia": best,
+        "streaming": any(s.get("torrentId") == t.get("id") for s in streams),
+    }
+
+
+def get_torrents(rpc, ids=None, fields=None):
+    params = {"fields": fields or TORRENT_FIELDS}
+    if ids is not None:
+        params["ids"] = ids
+    return rpc.call("torrent_get", params).get("torrents") or []
+
+
+def parse_id(s):
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        fail("bad torrent id: %r" % (s,))
+
+
+# ------------------------------------------------------------- subcommands
+
+def cmd_status(args):
+    cfg = load_config()
+    rpc, state = ensure_daemon(cfg, wait=3.0 if "--wait" in args else 0.0)
+    streams = list_streams()
+    result = {
+        "ok": True,
+        "daemon": state,
+        "config": cfg,
+        "streams": streams,
+        "torrents": [],
+        "rateDown": 0,
+        "rateUp": 0,
+        "scannedAt": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    if state == "running":
+        try:
+            ts = [shape_torrent(t, streams) for t in get_torrents(rpc)]
+            ts.sort(key=lambda t: (-t["addedDate"], t["name"]))
+            result["torrents"] = ts
+            result["rateDown"] = sum(t["rateDown"] for t in ts)
+            result["rateUp"] = sum(t["rateUp"] for t in ts)
+        except RpcError as e:
+            result["daemon"] = "down"
+            result["error"] = str(e)
+    out(result)
+
+
+def cmd_add(args):
+    if not args:
+        fail("usage: add <magnet|url|file.torrent> [--paused]")
+    src = args[0].strip()
+    paused = "--paused" in args
+    cfg = load_config()
+    rpc, state = ensure_daemon(cfg)
+    if state != "running":
+        fail("torrent daemon is not running (%s)" % state)
+    params = {"download_dir": cfg["downloadDir"], "paused": paused}
+    if src.startswith("file://"):
+        src = urllib.parse.unquote(src[7:])
+    local = os.path.expanduser(src)
+    if os.path.isfile(local):
+        with open(local, "rb") as f:
+            params["metainfo"] = base64.b64encode(f.read()).decode()
+    elif src.startswith("magnet:") or re.match(r"^https?://", src):
+        params["filename"] = src
+    elif re.fullmatch(r"[0-9a-fA-F]{40}", src):
+        params["filename"] = "magnet:?xt=urn:btih:" + src.lower()
+    else:
+        fail("not a magnet link, URL, or .torrent file: %s" % src)
+    try:
+        r = rpc.call("torrent_add", params)
+    except RpcError as e:
+        fail("add failed: %s" % e)
+    added = r.get("torrent_added") or r.get("torrent-added")
+    dup = r.get("torrent_duplicate") or r.get("torrent-duplicate")
+    t = added or dup or {}
+    out({"ok": True, "id": t.get("id"), "name": t.get("name"), "duplicate": bool(dup) and not added})
+
+
+def cmd_simple(method, args, extra=None):
+    if not args:
+        fail("missing torrent id")
+    tid = parse_id(args[0])
+    cfg = load_config()
+    rpc, state = ensure_daemon(cfg)
+    if state != "running":
+        fail("torrent daemon is not running (%s)" % state)
+    params = {"ids": [tid]}
+    if extra:
+        params.update(extra)
+    try:
+        rpc.call(method, params)
+    except RpcError as e:
+        fail("%s failed: %s" % (method, e))
+    out({"ok": True, "id": tid})
+
+
+def cmd_remove(args):
+    if not args:
+        fail("usage: remove <id> [--data]")
+    tid = parse_id(args[0])
+    for s in list_streams():
+        if s.get("torrentId") == tid:
+            unit_stop(s.get("unit") or stream_unit(tid, s.get("fileIndex")))
+    cmd_simple("torrent_remove", args, {"delete_local_data": "--data" in args})
+
+
+def cmd_sequential(args):
+    if len(args) < 2:
+        fail("usage: sequential <id> on|off")
+    cmd_simple("torrent_set", args, {"sequential_download": args[1] in ("on", "true", "1")})
+
+
+def cmd_wanted(args):
+    if len(args) < 3:
+        fail("usage: wanted <id> <fileIndex> on|off")
+    fidx = int(args[1])
+    key = "files_wanted" if args[2] in ("on", "true", "1") else "files_unwanted"
+    cmd_simple("torrent_set", args, {key: [fidx]})
+
+
+def cmd_open(args):
+    if not args:
+        fail("usage: open <id>")
+    tid = parse_id(args[0])
+    cfg = load_config()
+    rpc, state = ensure_daemon(cfg)
+    target = cfg["downloadDir"]
+    if state == "running":
+        try:
+            ts = get_torrents(rpc, [tid], ["name", "download_dir", "files"])
+            if ts:
+                t = ts[0]
+                candidate = os.path.join(t.get("download_dir") or cfg["downloadDir"], t.get("name") or "")
+                if os.path.isdir(candidate):
+                    target = candidate
+                elif t.get("download_dir"):
+                    target = t["download_dir"]
+        except RpcError:
+            pass
+    os.makedirs(target, exist_ok=True)
+    subprocess.Popen(["xdg-open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    out({"ok": True, "path": target})
+
+
+def cmd_daemon(args):
+    action = args[0] if args else "start"
+    cfg = load_config()
+    if action == "stop":
+        for s in list_streams():
+            unit_stop(s.get("unit") or "")
+        unit_stop(DAEMON_UNIT)
+        out({"ok": True, "daemon": "down"})
+    elif action == "restart":
+        unit_stop(DAEMON_UNIT)
+        rpc, state = ensure_daemon(cfg, wait=8.0)
+        out({"ok": state == "running", "daemon": state})
+    else:
+        rpc, state = ensure_daemon(cfg, wait=8.0)
+        out({"ok": state == "running", "daemon": state})
+
+
+def cmd_configure(args):
+    """configure '<json>' — merge settings from the shell into config.json and apply them live."""
+    if not args:
+        fail("usage: configure '<json>'")
+    try:
+        incoming = json.loads(args[0])
+    except ValueError:
+        fail("configure: bad json")
+    current = {}
+    try:
+        with open(CONFIG_FILE) as f:
+            current = json.load(f) or {}
+    except (OSError, ValueError):
+        pass
+    merged = dict(current)
+    for k in DEFAULT_CONFIG:
+        if k in incoming and incoming[k] not in (None, ""):
+            merged[k] = incoming[k]
+    changed = merged != current
+    if changed:
+        save_config(merged)
+    cfg = load_config()
+    rpc = Rpc(cfg["rpcPort"])
+    port_changed = int(current.get("rpcPort", DEFAULT_CONFIG["rpcPort"])) != cfg["rpcPort"]
+    if port_changed and unit_active(DAEMON_UNIT):
+        unit_stop(DAEMON_UNIT)
+        try:
+            os.unlink(daemon_settings_path())
+        except OSError:
+            pass
+    elif rpc.alive():
+        apply_session(rpc, cfg)
+    out({"ok": True, "changed": changed, "config": cfg})
+
+
+def cmd_clipboard(_args):
+    """Report a magnet / torrent candidate sitting in the Wayland clipboard."""
+    text = ""
+    if shutil.which("wl-paste"):
+        r = subprocess.run(["wl-paste", "--no-newline"], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            text = (r.stdout or "").strip()
+    cand = ""
+    if text and len(text) < 4000 and "\n" not in text:
+        if text.startswith("magnet:?") or re.fullmatch(r"[0-9a-fA-F]{40}", text):
+            cand = text
+        elif re.match(r"^https?://\S+\.torrent(\?\S*)?$", text, re.I):
+            cand = text
+        elif text.lower().endswith(".torrent") and os.path.isfile(os.path.expanduser(text.replace("file://", ""))):
+            cand = text
+    out({"ok": True, "candidate": cand})
+
+
+def cmd_pick(_args):
+    """Open a file chooser for a .torrent file and add it."""
+    if not shutil.which("zenity"):
+        fail("zenity is not installed")
+    r = subprocess.run([
+        "zenity", "--file-selection", "--title=Add torrent file",
+        "--file-filter=Torrent files | *.torrent", "--file-filter=All files | *",
+        "--filename=" + os.path.join(HOME, "Downloads") + "/",
+    ], capture_output=True, text=True)
+    path = (r.stdout or "").strip()
+    if r.returncode != 0 or not path:
+        out({"ok": True, "cancelled": True})
+        return
+    cmd_add([path])
+
+
+def cmd_register(_args):
+    """Make magnet links and .torrent files open through this plugin (xdg)."""
+    apps = os.path.join(HOME, ".local", "share", "applications")
+    os.makedirs(apps, exist_ok=True)
+    desktop = os.path.join(apps, "omarchy-torrent.desktop")
+    content = "\n".join([
+        "[Desktop Entry]",
+        "Type=Application",
+        "Name=Omarchy Torrent",
+        "Comment=Add a torrent to the Omarchy bar plugin",
+        "Exec=" + shlex.quote(SELF) + " add-notify %u",
+        "Icon=transmission",
+        "Terminal=false",
+        "NoDisplay=true",
+        "MimeType=x-scheme-handler/magnet;application/x-bittorrent;",
+        "",
+    ])
+    try:
+        with open(desktop) as f:
+            same = f.read() == content
+    except OSError:
+        same = False
+    if not same:
+        with open(desktop, "w") as f:
+            f.write(content)
+    for mime in ("x-scheme-handler/magnet", "application/x-bittorrent"):
+        subprocess.run(["xdg-mime", "default", "omarchy-torrent.desktop", mime], capture_output=True)
+    subprocess.run(["update-desktop-database", apps], capture_output=True)
+    out({"ok": True, "desktop": desktop})
+
+
+def cmd_add_notify(args):
+    """`add`, plus a desktop notification — used by the xdg handler."""
+    try:
+        buf = []
+        real_out = globals()["out"]
+
+        def capture(obj):
+            buf.append(obj)
+        globals()["out"] = capture
+        try:
+            cmd_add(args)
+        finally:
+            globals()["out"] = real_out
+        r = buf[-1] if buf else {}
+    except SystemExit:
+        r = {"ok": False, "error": "could not add torrent"}
+    if shutil.which("notify-send"):
+        if r.get("ok"):
+            msg = ("Already added: " if r.get("duplicate") else "Added: ") + (r.get("name") or "torrent")
+        else:
+            msg = "Torrent not added: " + str(r.get("error") or "unknown error")
+        subprocess.run(["notify-send", "-a", "Omarchy Torrent", "-i", "transmission", "Torrent", msg], capture_output=True)
+    out(r)
+
+
+# ---------------------------------------------------------------- streaming
+
+def cmd_stream(args):
+    """stream <id> <fileIndex> — start (or reuse) the range server for that file and launch the player."""
+    if len(args) < 2:
+        fail("usage: stream <id> <fileIndex>")
+    tid = parse_id(args[0])
+    fidx = int(args[1])
+    cfg = load_config()
+    rpc, state = ensure_daemon(cfg)
+    if state != "running":
+        fail("torrent daemon is not running (%s)" % state)
+    ts = get_torrents(rpc, [tid], ["id", "name", "files", "metadata_percent_complete"])
+    if not ts:
+        fail("torrent %d not found" % tid)
+    files = ts[0].get("files") or []
+    if fidx < 0 or fidx >= len(files):
+        fail("torrent has no file #%d yet (metadata %d%%)" % (fidx, round(100 * float(ts[0].get("metadata_percent_complete") or 0))))
+
+    marker = stream_marker(tid, fidx)
+    existing = None
+    for s in list_streams():
+        if s.get("torrentId") == tid and s.get("fileIndex") == fidx:
+            existing = s
+    if existing:
+        # Server already up: just (re)launch the player against it.
+        launch_player(cfg, existing["url"], existing.get("title") or "", detach=True)
+        out({"ok": True, "url": existing["url"], "reused": True})
+        return
+
+    os.makedirs(STREAMS_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    unit = stream_unit(tid, fidx)
+    unit_stop(unit)
+    try:
+        os.unlink(marker)
+    except OSError:
+        pass
+    subprocess.run([
+        "systemd-run", "--user", "--quiet", "--collect", "--unit=" + unit,
+        "--description=Omarchy torrent stream %d/%d" % (tid, fidx),
+        "-p", "StandardOutput=append:" + os.path.join(LOG_DIR, "stream-%d-%d.log" % (tid, fidx)),
+        "-p", "StandardError=append:" + os.path.join(LOG_DIR, "stream-%d-%d.log" % (tid, fidx)),
+        sys.executable, SELF, "serve", str(tid), str(fidx), "--play",
+    ], capture_output=True)
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        try:
+            with open(marker) as f:
+                m = json.load(f)
+            if m.get("url"):
+                out({"ok": True, "url": m["url"], "reused": False})
+                return
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.15)
+    fail("stream server did not come up (see %s)" % os.path.join(LOG_DIR, "stream-%d-%d.log" % (tid, fidx)))
+
+
+def cmd_stop_stream(args):
+    if len(args) < 1:
+        fail("usage: stop-stream <id> [fileIndex]")
+    tid = parse_id(args[0])
+    for s in list_streams():
+        if s.get("torrentId") == tid and (len(args) < 2 or s.get("fileIndex") == int(args[1])):
+            unit_stop(s.get("unit") or stream_unit(tid, s.get("fileIndex")))
+            try:
+                os.unlink(stream_marker(tid, s.get("fileIndex")))
+            except OSError:
+                pass
+    out({"ok": True})
+
+
+def player_command(cfg, url, title):
+    player = str(cfg.get("player") or "mpv")
+    if player.strip() == "mpv" or player.strip().startswith("mpv "):
+        cmd = shlex.split(player) + [
+            "--force-media-title=" + (title or "Torrent stream"),
+            "--cache=yes", "--cache-pause-initial=yes", "--demuxer-max-bytes=256MiB",
+            "--network-timeout=1800", "--stream-lavf-o=reconnect=1,reconnect_streamed=1",
+            url,
+        ]
+    else:
+        cmd = shlex.split(player) + [url]
+    return cmd
+
+
+def launch_player(cfg, url, title, detach=False):
+    """Run the player. Detached = its own transient unit (used when the caller is
+    a short-lived action process of the shell); otherwise a child the caller waits on."""
+    cmd = player_command(cfg, url, title)
+    if detach:
+        unit = "omarchy-torrent-player-%d" % int(time.time() * 1000)
+        subprocess.run(["systemd-run", "--user", "--quiet", "--collect", "--unit=" + unit,
+                        "--description=Omarchy torrent player"] + cmd, capture_output=True)
+        return None
+    return subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+
+
+class PieceTracker:
+    """Which pieces of the torrent are on disk, refreshed lazily through RPC."""
+
+    def __init__(self, rpc, tid, piece_size, piece_count):
+        self.rpc = rpc
+        self.tid = tid
+        self.piece_size = piece_size
+        self.piece_count = piece_count
+        self.bits = b""
+        self.fetched = 0.0
+        self.last_from = -1
+        self.lock = threading.Lock()
+        self.status = 4
+
+    def refresh(self, force=False):
+        with self.lock:
+            if not force and time.time() - self.fetched < 0.4:
+                return
+            ts = self.rpc.call("torrent_get", {"ids": [self.tid], "fields": ["pieces", "status", "sequential_download_from_piece"]}).get("torrents") or []
+            if not ts:
+                raise RpcError("torrent gone")
+            self.bits = base64.b64decode(ts[0].get("pieces") or "")
+            self.status = int(ts[0].get("status", 0))
+            self.fetched = time.time()
+
+    def have(self, piece):
+        byte = piece >> 3
+        if byte >= len(self.bits):
+            return False
+        return bool(self.bits[byte] & (0x80 >> (piece & 7)))
+
+    def have_range(self, first, last):
+        for p in range(first, last + 1):
+            if not self.have(p):
+                return p
+        return -1
+
+    def want_from(self, piece):
+        """Point Transmission's sequential frontier at `piece` (idempotent)."""
+        with self.lock:
+            if self.last_from == piece:
+                return
+            self.last_from = piece
+        try:
+            self.rpc.call("torrent_set", {"ids": [self.tid], "sequential_download": True, "sequential_download_from_piece": int(piece)})
+        except RpcError:
+            pass
+
+    def ensure_running(self):
+        if self.status in (0,):
+            try:
+                self.rpc.call("torrent_start", {"ids": [self.tid]})
+            except RpcError:
+                pass
+
+
+def cmd_serve(args):
+    if len(args) < 2:
+        fail("usage: serve <id> <fileIndex> [--play]")
+    tid = parse_id(args[0])
+    fidx = int(args[1])
+    play = "--play" in args
+    cfg = load_config()
+    rpc, state = ensure_daemon(cfg, wait=8.0)
+    if state != "running":
+        fail("torrent daemon is not running (%s)" % state)
+    ts = get_torrents(rpc, [tid], ["id", "name", "files", "piece_size", "piece_count", "download_dir", "status"])
+    if not ts:
+        fail("torrent %d not found" % tid)
+    t = ts[0]
+    files = t.get("files") or []
+    if fidx >= len(files):
+        fail("no such file")
+    f = files[fidx]
+    length = int(f.get("length") or 0)
+    offset = sum(int(x.get("length") or 0) for x in files[:fidx])
+    path = os.path.join(t.get("download_dir") or cfg["downloadDir"], f.get("name") or "")
+    piece_size = int(t.get("piece_size") or 0) or 1
+    piece_count = int(t.get("piece_count") or 0)
+    base = os.path.basename(f.get("name") or "stream")
+    ctype = mimetypes.guess_type(base)[0] or "application/octet-stream"
+    title = base if len(files) > 1 else (t.get("name") or base)
+
+    # Stream setup: sequential from the start, this file wanted + high priority, torrent running.
+    try:
+        rpc.call("torrent_set", {"ids": [tid], "files_wanted": [fidx], "priority_high": [fidx],
+                                 "sequential_download": True, "sequential_download_from_piece": offset // piece_size})
+        if int(t.get("status", 0)) == 0:
+            rpc.call("torrent_start", {"ids": [tid]})
+    except RpcError as e:
+        fail("could not prepare torrent: %s" % e)
+
+    tracker = PieceTracker(rpc, tid, piece_size, piece_count)
+    tracker.last_from = offset // piece_size
+    stop_event = threading.Event()
+
+    def wait_for(start, end):
+        """Block until the pieces covering file bytes [start, end] are on disk."""
+        first = (offset + start) // piece_size
+        last = (offset + end) // piece_size
+        waited = 0
+        while not stop_event.is_set():
+            tracker.refresh()
+            missing = tracker.have_range(first, last)
+            if missing < 0:
+                return True
+            tracker.ensure_running()
+            tracker.want_from(missing)
+            if waited == 0:
+                sys.stderr.write("waiting for piece %d (bytes %d-%d)\n" % (missing, start, end))
+                sys.stderr.flush()
+            waited += 1
+            stop_event.wait(0.5)
+        return False
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *a):
+            sys.stderr.write("http: " + (fmt % a) + "\n")
+
+        def _headers(self, code, start, end):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(end - start + 1))
+            if code == 206:
+                self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, length))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+        def _range(self):
+            rng = self.headers.get("Range")
+            if not rng or not rng.startswith("bytes="):
+                return 200, 0, length - 1
+            spec = rng[6:].split(",")[0].strip()
+            m = re.fullmatch(r"(\d*)-(\d*)", spec)
+            if not m:
+                return 200, 0, length - 1
+            a, b = m.group(1), m.group(2)
+            if a == "" and b == "":
+                return 200, 0, length - 1
+            if a == "":
+                n = min(int(b), length)
+                return 206, length - n, length - 1
+            start = int(a)
+            end = min(int(b), length - 1) if b else length - 1
+            if start >= length or start > end:
+                return 416, 0, length - 1
+            return 206, start, end
+
+        def do_HEAD(self):
+            code, start, end = self._range()
+            if code == 416:
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % length)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._headers(code, start, end)
+
+        def do_GET(self):
+            code, start, end = self._range()
+            if code == 416:
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % length)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._headers(code, start, end)
+            if length == 0:
+                return
+            # A seek far ahead: move the sequential frontier there right away.
+            tracker.want_from((offset + start) // piece_size)
+            pos = start
+            chunk = 1 << 20
+            fh = None
+            try:
+                while pos <= end and not stop_event.is_set():
+                    stop = min(end, pos + chunk - 1)
+                    if not wait_for(pos, stop):
+                        return
+                    if fh is None:
+                        fh = open(path, "rb")
+                    fh.seek(pos)
+                    data = fh.read(stop - pos + 1)
+                    if len(data) < stop - pos + 1:
+                        # Piece flushed but file not grown yet; retry shortly.
+                        fh.close()
+                        fh = None
+                        time.sleep(0.2)
+                        continue
+                    self.wfile.write(data)
+                    pos = stop + 1
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                if fh:
+                    fh.close()
+
+    class Server(http.server.ThreadingHTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    srv = Server(("127.0.0.1", 0), Handler)
+    port = srv.server_address[1]
+    url = "http://127.0.0.1:%d/%s" % (port, urllib.parse.quote(base))
+    os.makedirs(STREAMS_DIR, exist_ok=True)
+    marker = stream_marker(tid, fidx)
+    with open(marker + ".tmp", "w") as mf:
+        json.dump({"torrentId": tid, "fileIndex": fidx, "port": port, "url": url, "pid": os.getpid(),
+                   "unit": stream_unit(tid, fidx), "title": title, "file": base, "startedAt": time.time()}, mf)
+    os.replace(marker + ".tmp", marker)
+
+    def cleanup(*_a):
+        stop_event.set()
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+
+    atexit.register(cleanup)
+    signal.signal(signal.SIGTERM, lambda *_a: (cleanup(), os._exit(0)))
+    signal.signal(signal.SIGINT, lambda *_a: (cleanup(), os._exit(0)))
+
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    sys.stderr.write("serving %s (%s, %s) at %s\n" % (base, human_size(length), ctype, url))
+    sys.stderr.flush()
+
+    if play:
+        player = launch_player(cfg, url, title)
+        player.wait()
+        # Keep serving briefly so a player relaunch from the panel reuses this server.
+        idle_until = time.time() + 20
+        while time.time() < idle_until and not stop_event.is_set():
+            time.sleep(0.5)
+    else:
+        while not stop_event.is_set():
+            time.sleep(1)
+    cleanup()
+    srv.shutdown()
+
+
+# ---------------------------------------------------------------- dispatch
+
+COMMANDS = {
+    "status": cmd_status,
+    "add": cmd_add,
+    "add-notify": cmd_add_notify,
+    "pause": lambda a: cmd_simple("torrent_stop", a),
+    "resume": lambda a: cmd_simple("torrent_start", a),
+    "verify": lambda a: cmd_simple("torrent_verify", a),
+    "remove": cmd_remove,
+    "sequential": cmd_sequential,
+    "wanted": cmd_wanted,
+    "open": cmd_open,
+    "daemon": cmd_daemon,
+    "configure": cmd_configure,
+    "clipboard": cmd_clipboard,
+    "pick": cmd_pick,
+    "register": cmd_register,
+    "stream": cmd_stream,
+    "stop-stream": cmd_stop_stream,
+    "serve": cmd_serve,
+}
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        sys.stdout.write("usage: omarchy-torrent <%s> [args]\n" % "|".join(COMMANDS))
+        return 0
+    cmd = argv[1]
+    if cmd not in COMMANDS:
+        fail("unknown command: %s" % cmd)
+    try:
+        COMMANDS[cmd](argv[2:])
+    except RpcError as e:
+        fail(str(e))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

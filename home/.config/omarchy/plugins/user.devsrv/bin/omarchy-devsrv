@@ -1,0 +1,816 @@
+#!/usr/bin/env python3
+"""Local dev-server instance manager for the user.devsrv Omarchy plugin.
+
+  scan                 JSON: {"running": [...], "history": [...]}
+  start  <id>          re-run a remembered instance (transient systemd user unit)
+  stop   <id>          stop a running instance (unit or process tree)
+  open   <id>          open the project folder in the file manager
+  terminal <id>        open a terminal in the project folder
+  logs   <id>          tail the instance log in a terminal
+  url    <id> [port]   open http://localhost:<port> in the browser
+  forget <id>          drop an instance from history
+  add    <cwd> <cmd…>  remember a command without running it
+
+"Running" = every process owned by this user that LISTENs on a TCP port and
+whose working directory looks like a project (package.json, Cargo.toml, .git,
+…), plus any devsrv-* unit this tool started. The topmost ancestor sharing
+that cwd (stopping at interactive shells, terminals, systemd, editors) is
+taken as the command that was typed, so `npm run dev` is recorded rather than
+the `node vite` grandchild. Environment variables that differ from the
+desktop session's are remembered too, so re-runs get the same NODE_OPTIONS /
+DOTENV_CONFIG_PATH / PORT the original had.
+"""
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "omarchy-devsrv")
+LOG_DIR = os.path.join(STATE_DIR, "logs")
+HISTORY = os.path.join(STATE_DIR, "history.json")
+UNIT_PREFIX = "devsrv-"
+HOME = os.path.expanduser("~")
+
+PROJECT_MARKERS = (
+    "package.json", "Cargo.toml", "go.mod", "pyproject.toml", "requirements.txt", "Pipfile",
+    "Gemfile", "composer.json", "mix.exs", "pom.xml", "build.gradle", "build.gradle.kts",
+    "deno.json", "bun.lockb", "Makefile", "docker-compose.yml", "docker-compose.yaml",
+    "compose.yml", "compose.yaml", ".git", "manage.py", "artisan", "index.html",
+)
+# Server binaries worth listing even when their cwd carries no project marker
+# (a redis built in a temp dir, a postgres data directory, …).
+SERVER_BINS = {
+    "redis-server", "valkey-server", "postgres", "mysqld", "mariadbd", "mongod", "minio",
+    "memcached", "nats-server", "rabbitmq-server", "caddy", "nginx", "php", "php-fpm",
+    "mailhog", "mailpit", "hugo", "jekyll", "mkdocs", "flask", "uvicorn", "gunicorn",
+    "django-admin", "rails", "puma", "bun", "deno", "node", "python", "python3", "ruby",
+    "cargo", "go", "java", "dotnet", "vite", "next", "nuxt", "webpack", "ng", "expo",
+}
+INTERACTIVE_SHELLS = {"bash", "zsh", "fish", "sh", "dash", "nu", "elvish", "xonsh"}
+BOUNDARY_BINS = {
+    "systemd", "init", "tmux", "tmux: server", "screen", "alacritty", "foot", "kitty",
+    "ghostty", "wezterm", "wezterm-gui", "konsole", "gnome-terminal-server", "xterm",
+    "code", "code-oss", "codium", "cursor", "zed", "nvim", "vim", "emacs", "hx",
+    "claude", "codex", "omarchy-shell", "quickshell", "Hyprland", "uwsm-app",
+    "containerd-shim-runc-v2", "dockerd", "docker-proxy",
+}
+# Volatile / per-shell variables that must not be replayed on a re-run.
+ENV_SKIP_EXACT = {
+    "PWD", "OLDPWD", "SHLVL", "_", "TERM", "COLORTERM", "COLUMNS", "LINES", "INIT_CWD",
+    "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "WINDOWID", "TTY", "SHELL", "HOME", "USER",
+    "LOGNAME", "MANPATH", "INFOPATH", "INVOCATION_ID", "JOURNAL_STREAM", "LISTEN_PID",
+    "SYSTEMD_EXEC_PID", "MANAGERPID", "NOTIFY_SOCKET", "TMUX", "TMUX_PANE", "STY", "WINDOW",
+    "VTE_VERSION", "PROMPT_COMMAND", "PS1", "PS2", "HISTFILE", "TERMINAL", "EDITOR", "VISUAL",
+    "WEZTERM_PANE", "WEZTERM_UNIX_SOCKET", "KITTY_WINDOW_ID", "KITTY_PID", "KITTY_LISTEN_ON",
+    "GHOSTTY_RESOURCES_DIR", "GHOSTTY_BIN_DIR", "ALACRITTY_SOCKET", "ALACRITTY_LOG", "ALACRITTY_WINDOW_ID",
+    "STARSHIP_SESSION_KEY", "STARSHIP_SHELL", "ZSH", "OMARCHY_PATH",
+}
+ENV_SKIP_PREFIX = (
+    "npm_", "NPM_", "MISE_", "__MISE", "CLAUDE", "CODEX", "ANTHROPIC", "OPENAI", "NODE_REPL",
+    "XDG_", "DBUS_", "WAYLAND", "DISPLAY", "HYPRLAND", "QT_", "GTK_", "GDK_", "LC_", "LANG",
+    "SSH_", "GPG_", "DESKTOP", "SESSION", "MOTD", "LESS", "MAIL", "OMARCHY", "SYSTEMD_",
+    "PIPEWIRE", "PULSE", "TERMINFO", "WEZTERM", "KITTY", "GHOSTTY", "ALACRITTY", "FZF",
+    "STARSHIP", "ZSH_", "BASH_", "HIST", "VIRTUAL_ENV_PROMPT", "_P9K", "P9K", "TMUX",
+    "CONDA_PROMPT", "NVM_", "PYENV_SHELL", "RBENV_SHELL", "DIRENV_", "ZELLIJ",
+)
+
+
+# ---------------------------------------------------------------- utilities
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def load_history():
+    try:
+        with open(HISTORY) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_history(h):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = HISTORY + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(h, f, indent=2, sort_keys=True)
+    os.replace(tmp, HISTORY)
+
+
+def make_id(cwd, cmd):
+    return hashlib.sha1((cwd + "\n" + cmd).encode()).hexdigest()[:10]
+
+
+def display_name(cwd):
+    base = os.path.basename(cwd.rstrip("/")) or cwd
+    return base
+
+
+def short_path(p):
+    return "~" + p[len(HOME):] if p == HOME or p.startswith(HOME + "/") else p
+
+
+def read(path, default=""):
+    try:
+        with open(path, "rb") as f:
+            return f.read().decode(errors="replace")
+    except OSError:
+        return default
+
+
+def proc_cmdline(pid):
+    raw = read(f"/proc/{pid}/cmdline")
+    return [a for a in raw.split("\0") if a] if raw else []
+
+
+def proc_stat(pid):
+    raw = read(f"/proc/{pid}/stat")
+    if not raw:
+        return None
+    # comm can contain spaces/parens; it is wrapped in the last ')' of the line.
+    lp = raw.rfind(")")
+    comm = raw[raw.find("(") + 1:lp]
+    fields = raw[lp + 2:].split()
+    return {"comm": comm, "ppid": int(fields[1]), "starttime": int(fields[19])}
+
+
+def proc_cwd(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return ""
+
+
+def proc_environ(pid):
+    raw = read(f"/proc/{pid}/environ")
+    env = {}
+    for item in raw.split("\0"):
+        if "=" in item:
+            k, v = item.split("=", 1)
+            env[k] = v
+    return env
+
+
+def proc_unit(pid):
+    """devsrv unit id when the pid lives inside a devsrv-<id>.service cgroup."""
+    for line in read(f"/proc/{pid}/cgroup").splitlines():
+        m = re.search(r"/" + re.escape(UNIT_PREFIX) + r"([0-9a-f]+)\.service", line)
+        if m:
+            return m.group(1)
+    return ""
+
+
+_clk = os.sysconf("SC_CLK_TCK")
+_boot = None
+
+
+def proc_start_epoch(pid):
+    global _boot
+    st = proc_stat(pid)
+    if not st:
+        return 0
+    if _boot is None:
+        for line in read("/proc/stat").splitlines():
+            if line.startswith("btime "):
+                _boot = int(line.split()[1])
+                break
+        _boot = _boot or 0
+    return _boot + st["starttime"] // _clk
+
+
+def basename_of(argv, comm):
+    if not argv:
+        return comm
+    exe = os.path.basename(argv[0])
+    # `node /path/to/vite.js` → look at the script too, so `vite` is recognised.
+    return exe
+
+
+def is_interactive_shell(argv, comm):
+    exe = os.path.basename(argv[0]).lstrip("-") if argv else comm
+    if exe not in INTERACTIVE_SHELLS:
+        return False
+    return not any(a in ("-c", "-lc", "-ic") for a in argv[1:])
+
+
+def is_boundary(argv, comm):
+    exe = os.path.basename(argv[0]) if argv else comm
+    return exe in BOUNDARY_BINS or comm in BOUNDARY_BINS
+
+
+def looks_like_project(cwd):
+    if not cwd or cwd == "/" or cwd.startswith(("/usr", "/etc", "/proc", "/sys", "/opt/")):
+        return False
+    return any(os.path.exists(os.path.join(cwd, m)) for m in PROJECT_MARKERS)
+
+
+def is_shell(argv, comm):
+    exe = os.path.basename(argv[0]).lstrip("-") if argv else comm
+    return exe in INTERACTIVE_SHELLS
+
+
+def top_ancestor(pid):
+    """Highest ancestor that shares the cwd and is not a shell wrapper.
+
+    Stops at interactive shells, terminals, editors, systemd and agents. `sh -c`
+    wrappers (npm's, or an agent's `bash -c`) are climbed through but never
+    chosen, so the recorded command is `npm run dev`, not `sh -c vite`.
+    """
+    cwd = proc_cwd(pid)
+    cur = pid
+    best = pid
+    seen = 0
+    while seen < 32:
+        seen += 1
+        st = proc_stat(cur)
+        if not st:
+            break
+        ppid = st["ppid"]
+        if ppid <= 1:
+            break
+        pargv = proc_cmdline(ppid)
+        pst = proc_stat(ppid)
+        if not pst:
+            break
+        if proc_cwd(ppid) != cwd:
+            break
+        if is_interactive_shell(pargv, pst["comm"]) or is_boundary(pargv, pst["comm"]):
+            break
+        if proc_unit(ppid) != proc_unit(cur):
+            break
+        cur = ppid
+        if not is_shell(pargv, pst["comm"]):
+            best = cur
+    return best
+
+
+def render_cmd(argv):
+    if not argv:
+        return ""
+    # node rewrites its title into one argv slot ("npm run dev"); show it raw.
+    if len(argv) == 1:
+        return argv[0]
+    out = []
+    for a in argv:
+        out.append(shlex.quote(a))
+    cmd = " ".join(out)
+    # `bash -lc '<cmd>'` is our own launcher wrapper; show the inner command.
+    if len(argv) >= 3 and os.path.basename(argv[0]) in INTERACTIVE_SHELLS and argv[1] in ("-lc", "-c"):
+        return argv[2]
+    return cmd
+
+
+def env_diff(env):
+    base = os.environ
+    diff = {}
+    for k, v in env.items():
+        if k in ENV_SKIP_EXACT or k.startswith(ENV_SKIP_PREFIX):
+            continue
+        if base.get(k) == v:
+            continue
+        if len(v) > 2000:
+            continue
+        diff[k] = v
+    return diff
+
+
+
+# -------------------------------------------------------------------- docker
+
+_docker_mode = None  # "direct" | "newgrp" | "none"
+
+
+def docker_run(args, timeout=20, check=False):
+    """Run a docker CLI command, falling back to `newgrp docker` when this
+    process predates the user's docker-group membership (the shell is
+    started at login, so a freshly added group is not in its credentials)."""
+    global _docker_mode
+    if not shutil.which("docker"):
+        _docker_mode = "none"
+        return None
+    if _docker_mode in (None, "direct"):
+        try:
+            r = subprocess.run(["docker"] + args, capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode == 0 or "permission denied" not in (r.stderr or "").lower():
+            _docker_mode = "direct"
+            return r
+        _docker_mode = "newgrp"
+    if _docker_mode == "newgrp" and shutil.which("newgrp"):
+        script = "exec docker " + " ".join(shlex.quote(a) for a in args) + "\n"
+        try:
+            r = subprocess.run(["newgrp", "docker"], input=script, capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if "permission denied" in (r.stderr or "").lower():
+            _docker_mode = "none"
+            return None
+        return r
+    return None
+
+
+def docker_id(kind, key):
+    return hashlib.sha1((kind + ":" + key).encode()).hexdigest()[:10]
+
+
+def docker_instances():
+    """Running containers grouped into compose projects → instance dicts."""
+    r = docker_run(["ps", "-q"], timeout=10)
+    if not r or r.returncode != 0:
+        return []
+    ids = r.stdout.split()
+    if not ids:
+        return []
+    r = docker_run(["inspect"] + ids, timeout=20)
+    if not r or r.returncode != 0:
+        return []
+    try:
+        infos = json.loads(r.stdout)
+    except ValueError:
+        return []
+    out = {}
+    for c in infos:
+        labels = (c.get("Config") or {}).get("Labels") or {}
+        name = (c.get("Name") or "").lstrip("/")
+        started = ((c.get("State") or {}).get("StartedAt") or "")
+        since = 0
+        try:
+            since = int(datetime.fromisoformat(started.replace("Z", "+00:00")[:26] + "+00:00").timestamp()) if started else 0
+        except ValueError:
+            try:
+                since = int(datetime.strptime(started[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp())
+            except ValueError:
+                since = 0
+        ports = []
+        for spec, binds in ((c.get("NetworkSettings") or {}).get("Ports") or {}).items():
+            for b in binds or []:
+                try:
+                    hp = int(b.get("HostPort") or 0)
+                except ValueError:
+                    hp = 0
+                if hp and not any(p["port"] == hp for p in ports):
+                    ports.append({"port": hp, "addr": b.get("HostIp") or "0.0.0.0"})
+        project = labels.get("com.docker.compose.project")
+        if project:
+            workdir = labels.get("com.docker.compose.project.working_dir") or ""
+            files = labels.get("com.docker.compose.project.config_files") or ""
+            iid = docker_id("compose", workdir + "|" + project)
+            file_args = " ".join("-f " + shlex.quote(os.path.basename(f) if workdir and f.startswith(workdir + "/") else f) for f in files.split(",") if f)
+            cmd = ("docker compose " + file_args + " up -d").replace("  ", " ")
+            inst = out.setdefault(iid, {
+                "id": iid, "name": project, "cwd": workdir, "cmd": cmd, "ports": [], "pid": 0,
+                "unit": False, "since": since, "env": {}, "kind": "compose",
+                "docker": {"project": project, "files": files, "workdir": workdir, "containers": []},
+            })
+            inst["docker"]["containers"].append(name)
+            inst["since"] = min(inst["since"] or since, since) if since else inst["since"]
+        else:
+            iid = docker_id("container", name)
+            image = (c.get("Config") or {}).get("Image") or ""
+            inst = out.setdefault(iid, {
+                "id": iid, "name": name, "cwd": "", "cmd": "docker start " + shlex.quote(name) + ("   # " + image if image else ""),
+                "ports": [], "pid": 0, "unit": False, "since": since, "env": {}, "kind": "container",
+                "docker": {"container": name, "image": image},
+            })
+        for p in ports:
+            if not any(q["port"] == p["port"] for q in inst["ports"]):
+                inst["ports"].append(p)
+    return list(out.values())
+
+
+def docker_compose_argv(rec):
+    d = rec.get("docker") or {}
+    argv = ["compose"]
+    for f in (d.get("files") or "").split(","):
+        if f:
+            argv += ["-f", f]
+    if d.get("project"):
+        argv += ["-p", d["project"]]
+    return argv
+
+
+def docker_start(iid, rec):
+    d = rec.get("docker") or {}
+    if rec.get("kind") == "compose":
+        if not os.path.isdir(rec["cwd"]):
+            fail("project folder is gone: " + rec["cwd"])
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(log_path(iid), "a") as f:
+            f.write(f"\\n===== {now_iso()}  docker compose up -d  (in {rec['cwd']})\\n")
+        r = docker_run(docker_compose_argv(rec) + ["up", "-d", "--remove-orphans"], timeout=900)
+    else:
+        r = docker_run(["start", d.get("container", "")], timeout=60)
+    if not r:
+        fail("docker is not reachable (is your user in the docker group?)")
+    if r.returncode != 0:
+        fail("docker: " + (r.stderr.strip().splitlines() or ["failed"])[-1])
+    h = load_history()
+    if iid in h:
+        h[iid]["runs"] = h[iid].get("runs", 0) + 1
+        h[iid]["lastStarted"] = now_iso()
+        h[iid]["lastSeen"] = now_iso()
+        save_history(h)
+    print(json.dumps({"ok": True, "how": rec.get("kind")}))
+
+
+def docker_stop(iid, rec):
+    d = rec.get("docker") or {}
+    if rec.get("kind") == "compose":
+        r = docker_run(docker_compose_argv(rec) + ["down"], timeout=120)
+    else:
+        r = docker_run(["stop", d.get("container", "")], timeout=60)
+    if not r:
+        fail("docker is not reachable")
+    if r.returncode != 0:
+        fail("docker: " + (r.stderr.strip().splitlines() or ["failed"])[-1])
+    print(json.dumps({"ok": True, "how": rec.get("kind")}))
+
+
+def docker_logs_cmd(rec):
+    d = rec.get("docker") or {}
+    if rec.get("kind") == "compose":
+        return ["docker"] + docker_compose_argv(rec) + ["logs", "-f", "--tail", "300"]
+    return ["docker", "logs", "-f", "--tail", "300", d.get("container", "")]
+
+
+# ------------------------------------------------------------------ scanning
+
+def listening_ports():
+    """{pid: [{"port": int, "addr": str}]} for this user's listening TCP sockets."""
+    try:
+        out = subprocess.run(["ss", "-ltnpH"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    res = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        local = parts[3]
+        m = re.match(r"^(.*):(\d+)$", local)
+        if not m:
+            continue
+        addr, port = m.group(1), int(m.group(2))
+        addr = addr.strip("[]")
+        if addr.endswith("%lo"):
+            addr = addr[:-3]
+        for pm in re.finditer(r"pid=(\d+)", line):
+            pid = int(pm.group(1))
+            res.setdefault(pid, [])
+            if not any(p["port"] == port for p in res[pid]):
+                res[pid].append({"port": port, "addr": addr})
+    return res
+
+
+def active_units():
+    """{id: {"unit":..., "active": bool, "pid": int}} for devsrv-* user units."""
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "list-units", UNIT_PREFIX + "*", "--all", "--no-legend", "--plain", "--output=json"],
+            capture_output=True, text=True, timeout=5).stdout
+        units = json.loads(out or "[]")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        units = []
+    res = {}
+    for u in units:
+        name = u.get("unit", "")
+        m = re.match(re.escape(UNIT_PREFIX) + r"([0-9a-f]+)\.service$", name)
+        if not m:
+            continue
+        pid = 0
+        try:
+            p = subprocess.run(["systemctl", "--user", "show", name, "-p", "MainPID", "--value"],
+                               capture_output=True, text=True, timeout=5).stdout.strip()
+            pid = int(p or 0)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        res[m.group(1)] = {"unit": name, "active": u.get("active") == "active" and u.get("sub") == "running", "pid": pid}
+    return res
+
+
+def scan():
+    history = load_history()
+    units = active_units()
+    ports_by_pid = listening_ports()
+    running = {}
+
+    # 1. Anything listening on a port in a project directory.
+    for pid, ports in ports_by_pid.items():
+        argv = proc_cmdline(pid)
+        st = proc_stat(pid)
+        if not st or not argv:
+            continue
+        cwd = proc_cwd(pid)
+        exe = basename_of(argv, st["comm"])
+        if not (looks_like_project(cwd) or exe in SERVER_BINS):
+            continue
+        if not cwd or cwd == "/" or cwd.startswith("/usr"):
+            continue
+        top = top_ancestor(pid)
+        unit_id = proc_unit(top)
+        targv = proc_cmdline(top) or argv
+        cmd = render_cmd(targv)
+        if unit_id and unit_id in history:
+            rec = history[unit_id]
+            iid, cmd, cwd = unit_id, rec["cmd"], rec["cwd"]
+        else:
+            iid = make_id(cwd, cmd)
+        entry = running.setdefault(iid, {
+            "id": iid, "name": display_name(cwd), "cwd": cwd, "cmd": cmd, "ports": [],
+            "pid": top, "unit": bool(unit_id), "since": proc_start_epoch(top), "env": None, "kind": "process",
+        })
+        for p in ports:
+            if not any(q["port"] == p["port"] for q in entry["ports"]):
+                entry["ports"].append(p)
+        if entry["env"] is None and not unit_id:
+            entry["env"] = env_diff(proc_environ(top))
+
+    # 2. Units we started that have no listening socket (yet, or at all).
+    for iid, u in units.items():
+        if not u["active"] or iid in running or iid not in history:
+            continue
+        rec = history[iid]
+        running[iid] = {
+            "id": iid, "name": rec.get("name") or display_name(rec["cwd"]), "cwd": rec["cwd"],
+            "cmd": rec["cmd"], "ports": [], "pid": u["pid"], "unit": True,
+            "since": proc_start_epoch(u["pid"]) if u["pid"] else 0, "env": None, "kind": "process",
+        }
+
+    # 2b. Docker: compose projects (one row each) and standalone containers.
+    for inst in docker_instances():
+        if inst["id"] not in running:
+            running[inst["id"]] = inst
+
+    # 3. Remember every running instance.
+    changed = False
+    for iid, r in running.items():
+        rec = history.get(iid) or {}
+        new = {
+            "id": iid, "name": rec.get("name") or r["name"], "cwd": r["cwd"], "cmd": r["cmd"],
+            "env": r["env"] if r["env"] is not None else rec.get("env", {}),
+            "ports": [p["port"] for p in r["ports"]] or rec.get("ports", []),
+            "lastSeen": now_iso(), "firstSeen": rec.get("firstSeen") or now_iso(),
+            "runs": rec.get("runs", 0),
+            "kind": r.get("kind", "process"),
+            "docker": r.get("docker") or rec.get("docker") or {},
+        }
+        if new != rec:
+            history[iid] = new
+            changed = True
+        r["ports"].sort(key=lambda p: p["port"])
+        r.pop("env", None)
+        r["log"] = "docker" if r.get("kind") in ("compose", "container") else (log_path(iid) if os.path.exists(log_path(iid)) else "")
+        r["cwdShort"] = short_path(r["cwd"]) if r["cwd"] else ""
+        r["exists"] = os.path.isdir(r["cwd"]) if r["cwd"] else (r.get("kind") == "container")
+    if changed:
+        save_history(history)
+
+    hist = []
+    for iid, rec in history.items():
+        item = dict(rec)
+        item["running"] = iid in running
+        item["cwdShort"] = short_path(rec["cwd"]) if rec.get("cwd") else ""
+        item["exists"] = os.path.isdir(rec["cwd"]) if rec.get("cwd") else (rec.get("kind") == "container")
+        item["log"] = "docker" if rec.get("kind") in ("compose", "container") else (log_path(iid) if os.path.exists(log_path(iid)) else "")
+        hist.append(item)
+    hist.sort(key=lambda h: h.get("lastSeen", ""), reverse=True)
+    run_list = sorted(running.values(), key=lambda r: (r["ports"][0]["port"] if r["ports"] else 1 << 20, r["name"]))
+    return {"running": run_list, "history": hist, "scannedAt": now_iso()}
+
+
+# ------------------------------------------------------------------- actions
+
+def log_path(iid):
+    return os.path.join(LOG_DIR, iid + ".log")
+
+
+def unit_name(iid):
+    return UNIT_PREFIX + iid + ".service"
+
+
+def fail(msg, code=1):
+    print(json.dumps({"ok": False, "error": msg}))
+    sys.exit(code)
+
+
+def get_record(iid):
+    rec = load_history().get(iid)
+    if not rec:
+        # Maybe a running-but-unrecorded instance: scan once to record it.
+        scan()
+        rec = load_history().get(iid)
+    if not rec:
+        fail("unknown instance " + iid)
+    return rec
+
+
+def start(iid):
+    rec = get_record(iid)
+    if rec.get("kind") in ("compose", "container"):
+        return docker_start(iid, rec)
+    if not os.path.isdir(rec["cwd"]):
+        fail("project folder is gone: " + rec["cwd"])
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log = log_path(iid)
+    with open(log, "a") as f:
+        f.write(f"\n===== {now_iso()}  {rec['cmd']}  (in {rec['cwd']})\n")
+    unit = unit_name(iid)
+    subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True)
+    subprocess.run(["systemctl", "--user", "reset-failed", unit], capture_output=True)
+    argv = [
+        "systemd-run", "--user", "--quiet", "--collect", "--unit=" + unit,
+        "--description=devsrv: " + rec["cmd"] + " (" + short_path(rec["cwd"]) + ")",
+        "--working-directory=" + rec["cwd"],
+        "-p", "StandardOutput=append:" + log, "-p", "StandardError=append:" + log,
+        "-p", "KillMode=mixed", "-p", "TimeoutStopSec=15",
+    ]
+    for k, v in (rec.get("env") or {}).items():
+        argv += ["--setenv", f"{k}={v}"]
+    # A login shell so mise/nvm/direnv shims and the user's PATH are in place,
+    # exactly as when the command was typed into a terminal.
+    argv += ["bash", "-lc", rec["cmd"]]
+    r = subprocess.run(argv, capture_output=True, text=True)
+    if r.returncode != 0:
+        fail("systemd-run failed: " + (r.stderr.strip() or str(r.returncode)))
+    h = load_history()
+    h[iid]["runs"] = h[iid].get("runs", 0) + 1
+    h[iid]["lastStarted"] = now_iso()
+    h[iid]["lastSeen"] = now_iso()
+    save_history(h)
+    print(json.dumps({"ok": True, "unit": unit, "log": log}))
+
+
+def descendants(pid):
+    kids = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        st = proc_stat(int(entry))
+        if st:
+            kids.setdefault(st["ppid"], []).append(int(entry))
+    out, stack = [], [pid]
+    while stack:
+        p = stack.pop()
+        out.append(p)
+        stack.extend(kids.get(p, []))
+    return out
+
+
+def stop(iid):
+    rec = load_history().get(iid) or {}
+    if rec.get("kind") in ("compose", "container"):
+        return docker_stop(iid, rec)
+    unit = unit_name(iid)
+    r = subprocess.run(["systemctl", "--user", "is-active", unit], capture_output=True, text=True)
+    if r.stdout.strip() in ("active", "activating", "deactivating"):
+        subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True)
+        print(json.dumps({"ok": True, "how": "unit"}))
+        return
+    data = scan()
+    inst = next((x for x in data["running"] if x["id"] == iid), None)
+    if not inst:
+        fail("instance is not running")
+    pids = descendants(inst["pid"])
+    for p in reversed(pids):
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + 6
+    while time.time() < deadline:
+        alive = [p for p in pids if os.path.exists(f"/proc/{p}")]
+        if not alive:
+            break
+        time.sleep(0.2)
+    for p in pids:
+        if os.path.exists(f"/proc/{p}"):
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+    print(json.dumps({"ok": True, "how": "signal", "pids": pids}))
+
+
+def detach(argv, cwd=None):
+    subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def open_folder(iid):
+    rec = get_record(iid)
+    if not rec.get("cwd"):
+        fail("a standalone container has no project folder")
+    if not os.path.isdir(rec["cwd"]):
+        fail("project folder is gone: " + rec["cwd"])
+    if shutil.which("nautilus"):
+        detach(["nautilus", "--new-window", rec["cwd"]])
+    else:
+        detach(["xdg-open", rec["cwd"]])
+    print(json.dumps({"ok": True}))
+
+
+def terminal_cmd(cwd, *cmd):
+    """Best-effort terminal launch in `cwd`, running `cmd` if given."""
+    term = os.environ.get("TERMINAL") or ("xdg-terminal-exec" if shutil.which("xdg-terminal-exec") else "")
+    if term == "xdg-terminal-exec" or os.path.basename(term) == "xdg-terminal-exec":
+        argv = ["xdg-terminal-exec", "--dir=" + cwd] + list(cmd)
+    elif os.path.basename(term) in ("alacritty", "kitty", "wezterm", "foot", "ghostty"):
+        argv = [term, "--working-directory", cwd] if os.path.basename(term) != "foot" else [term, "--working-directory=" + cwd]
+        if cmd:
+            argv += ["-e"] + list(cmd)
+    else:
+        argv = ["xdg-terminal-exec", "--dir=" + cwd] + list(cmd)
+    if shutil.which("uwsm-app"):
+        argv = ["setsid", "uwsm-app", "--"] + argv
+    detach(argv, cwd=cwd)
+
+
+def open_terminal(iid):
+    rec = get_record(iid)
+    if not rec.get("cwd"):
+        fail("a standalone container has no project folder")
+    if not os.path.isdir(rec["cwd"]):
+        fail("project folder is gone: " + rec["cwd"])
+    terminal_cmd(rec["cwd"])
+    print(json.dumps({"ok": True}))
+
+
+def logs(iid):
+    rec = get_record(iid)
+    if rec.get("kind") in ("compose", "container"):
+        terminal_cmd(rec["cwd"] if rec.get("cwd") and os.path.isdir(rec["cwd"]) else HOME, *docker_logs_cmd(rec))
+        print(json.dumps({"ok": True, "log": "docker"}))
+        return
+    log = log_path(iid)
+    if not os.path.exists(log):
+        fail("no log yet — logs exist only for instances started from the panel")
+    terminal_cmd(rec["cwd"] if os.path.isdir(rec["cwd"]) else HOME, "tail", "-n", "300", "-f", log)
+    print(json.dumps({"ok": True, "log": log}))
+
+
+def url(iid, port=None):
+    rec = get_record(iid)
+    if port is None:
+        data = scan()
+        inst = next((x for x in data["running"] if x["id"] == iid), None)
+        ports = [p["port"] for p in inst["ports"]] if inst else rec.get("ports", [])
+        if not ports:
+            fail("no listening port")
+        port = ports[0]
+    detach(["xdg-open", f"http://localhost:{int(port)}/"])
+    print(json.dumps({"ok": True, "url": f"http://localhost:{int(port)}/"}))
+
+
+def forget(iid):
+    h = load_history()
+    if iid in h:
+        del h[iid]
+        save_history(h)
+    try:
+        os.remove(log_path(iid))
+    except OSError:
+        pass
+    print(json.dumps({"ok": True}))
+
+
+def add(cwd, cmd_argv):
+    cwd = os.path.abspath(cwd)
+    cmd = " ".join(shlex.quote(a) for a in cmd_argv) if len(cmd_argv) > 1 else cmd_argv[0]
+    iid = make_id(cwd, cmd)
+    h = load_history()
+    h[iid] = {"id": iid, "name": display_name(cwd), "cwd": cwd, "cmd": cmd, "env": {},
+              "ports": [], "lastSeen": now_iso(), "firstSeen": now_iso(), "runs": 0}
+    save_history(h)
+    print(json.dumps({"ok": True, "id": iid}))
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return
+    op = args[0]
+    if op == "scan":
+        print(json.dumps(scan()))
+    elif op in ("start", "stop", "open", "terminal", "logs", "forget") and len(args) >= 2:
+        {"start": start, "stop": stop, "open": open_folder, "terminal": open_terminal,
+         "logs": logs, "forget": forget}[op](args[1])
+    elif op == "url" and len(args) >= 2:
+        url(args[1], args[2] if len(args) > 2 else None)
+    elif op == "add" and len(args) >= 3:
+        add(args[1], args[2:])
+    else:
+        fail("usage: " + __doc__.strip().splitlines()[2].strip())
+
+
+if __name__ == "__main__":
+    main()

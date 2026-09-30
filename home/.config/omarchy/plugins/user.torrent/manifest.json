@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "id": "user.torrent",
+  "name": "Torrents",
+  "version": "1.0.0",
+  "author": "user",
+  "description": "Download torrents (magnet links, .torrent files) through a per-user transmission-daemon and stream video/audio out of them while they download",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Engine.qml",
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Torrents",
+    "description": "Bar download indicator; the panel adds magnet links / .torrent files, shows progress, and plays media files straight from a running download (sequential download + local range server → mpv).",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "downloadDir": "~/Downloads/Torrents",
+      "rpcPort": 9091,
+      "seedRatioLimit": 2.0,
+      "player": "mpv",
+      "pollSeconds": 4,
+      "showSpeedInBar": true,
+      "handleMagnetLinks": true
+    },
+    "schema": [
+      {
+        "key": "downloadDir",
+        "type": "string",
+        "label": "Download folder",
+        "defaultValue": "~/Downloads/Torrents"
+      },
+      {
+        "key": "rpcPort",
+        "type": "number",
+        "label": "Transmission RPC port (localhost only)",
+        "defaultValue": 9091
+      },
+      {
+        "key": "seedRatioLimit",
+        "type": "number",
+        "label": "Stop seeding at ratio (0 = seed forever)",
+        "defaultValue": 2.0
+      },
+      {
+        "key": "player",
+        "type": "string",
+        "label": "Player command for streams",
+        "defaultValue": "mpv",
+        "description": "mpv gets tuned cache/timeout flags; any other command receives just the stream URL."
+      },
+      {
+        "key": "pollSeconds",
+        "type": "number",
+        "label": "Refresh interval while the panel is closed (seconds)",
+        "defaultValue": 4
+      },
+      {
+        "key": "showSpeedInBar",
+        "type": "boolean",
+        "label": "Show the download speed next to the bar icon while downloading",
+        "defaultValue": true
+      },
+      {
+        "key": "handleMagnetLinks",
+        "type": "boolean",
+        "label": "Open magnet links and .torrent files from the browser here",
+        "defaultValue": true
+      }
+    ]
+  }
+}

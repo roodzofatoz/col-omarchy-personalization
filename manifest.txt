@@ -1,0 +1,64 @@
+# Tracked paths. One per line: "<kind> <path>".
+#   home   — path relative to $HOME, stored under home/<path>
+#   system — absolute path, stored under system/<path>
+# A trailing slash marks a directory (synced recursively, exclusions from rsync-exclude.txt apply).
+# Both sync.sh (machine → repo) and apply.sh (repo → machine) read this file.
+
+# --- Omarchy shell -----------------------------------------------------------
+home .config/omarchy/shell.json
+home .config/omarchy/shell.toml
+home .config/omarchy/grid.json
+home .config/omarchy/monitor-workspaces.json
+home .config/omarchy/defaults/agent
+home .config/omarchy/extensions/omarchy-menu.jsonc
+home .config/omarchy/plugins/
+
+# --- Hyprland (only the files that differ from Omarchy's templates) ----------
+home .config/hypr/bindings.lua
+home .config/hypr/monitors.lua
+home .config/hypr/looknfeel.lua
+home .config/hypr/autostart.lua
+home .config/hypr/hyprland.lua
+
+# --- Terminals ---------------------------------------------------------------
+home .config/alacritty/alacritty.toml
+home .config/foot/foot.ini
+home .config/kitty/kitty.conf
+home .config/ghostty/config
+
+# --- Editors / misc app config ----------------------------------------------
+home .config/nvim/
+home .config/tmux/tmux.conf
+home .config/git/config
+home .config/mimeapps.list
+home .config/user-dirs.dirs
+home .config/environment.d/omarchy-firefox-wayland.conf
+
+# --- Scripts the Hyprland config depends on ----------------------------------
+home .local/bin/omarchy-grid
+home .local/bin/omarchy-monitor-workspace
+
+# --- Launchers and fonts -----------------------------------------------------
+home .local/share/applications/ChatGPT.desktop
+home .local/share/applications/Figma.desktop
+home .local/share/applications/GitHub.desktop
+home .local/share/applications/Fizzy.desktop
+home .local/share/applications/claude-code-url-handler.desktop
+home .local/share/applications/omarchy-torrent.desktop
+home .local/share/applications/typora.desktop
+home .local/share/fonts/
+
+# --- Shell -------------------------------------------------------------------
+home .bash_profile
+
+# --- Claude Code setup (no credentials: .credentials.json and ~/.claude.json are never tracked)
+home .claude/settings.json
+home .claude/hooks/
+home .claude/themes/omarchy.json
+home .claude/pilotfish-roles.sh
+home .claude/plugins/installed_plugins.json
+home .claude/plugins/known_marketplaces.json
+
+# --- System (root; apply.sh only installs these with --system) --------------
+system /etc/udev/rules.d/60-omarchy-a75-hidraw.rules
+system /etc/udev/rules.d/60-omarchy-mouse-hidraw.rules

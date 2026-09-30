@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Omarchy Torrent
+Comment=Add a torrent to the Omarchy bar plugin
+Exec=/home/user/.config/omarchy/plugins/user.torrent/bin/omarchy-torrent add-notify %u
+Icon=transmission
+Terminal=false
+NoDisplay=true
+MimeType=x-scheme-handler/magnet;application/x-bittorrent;

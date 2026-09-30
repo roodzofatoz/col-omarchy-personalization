@@ -1,0 +1,7 @@
+# Grant the user logged in on the active seat access to Razer HID control
+# interfaces, so the Omarchy "user.mouse" bar plugin can read battery level,
+# DPI and polling rate directly over hidraw -- no kernel module, no daemon.
+#
+# TAG+="uaccess" makes systemd-logind attach an ACL for the active seat user
+# instead of loosening the file mode for everyone.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", TAG+="uaccess"

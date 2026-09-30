@@ -1,0 +1,128 @@
+{
+  "bar": {
+    "centerAnchor": "omarchy.clock",
+    "hideOnMonitors": [
+      "DP-1",
+      "HDMI-A-1"
+    ],
+    "id": "user.bar",
+    "layout": {
+      "center": [
+        {
+          "id": "user.indicators"
+        },
+        {
+          "format": "dddd h:mm AP",
+          "formatAlt": "d MMMM 'W'ww yyyy",
+          "id": "omarchy.clock",
+          "verticalFormat": "h\n—\nmm\nAP"
+        },
+        {
+          "id": "omarchy.keyboard-layout"
+        },
+        {
+          "id": "omarchy.weather"
+        },
+        {
+          "id": "user.snip"
+        },
+        {
+          "id": "omarchy.system-update"
+        },
+        {
+          "id": "user.gpu"
+        }
+      ],
+      "left": [
+        {
+          "id": "omarchy.menu"
+        },
+        {
+          "id": "user.workspaces"
+        }
+      ],
+      "right": [
+        {
+          "id": "omarchy.tray"
+        },
+        {
+          "id": "user.a75"
+        },
+        {
+          "id": "user.mouse"
+        },
+        {
+          "id": "omarchy.agents"
+        },
+        {
+          "id": "user.bluetooth"
+        },
+        {
+          "id": "omarchy.network"
+        },
+        {
+          "id": "user.torrent",
+          "downloadDir": "~/Downloads/Torrents",
+          "seedRatioLimit": 2
+        },
+        {
+          "id": "user.devsrv"
+        },
+        {
+          "id": "user.flac",
+          "alsaDevice": "alsa/hw:CARD=Bathys,DEV=0",
+          "exclusive": false,
+          "libraryDir": "/home/user/Downloads & Media/Music",
+          "pwDeviceName": "alsa_card.usb-Focal_JMLab_Focal_Bathys-01"
+        },
+        {
+          "id": "omarchy.audio"
+        },
+        {
+          "id": "omarchy.monitor"
+        },
+        {
+          "id": "omarchy.power"
+        }
+      ]
+    },
+    "position": "top",
+    "transparent": false
+  },
+  "cloneSourceRestores": [
+    "user.notifications"
+  ],
+  "disabledPlugins": [
+    "omarchy.notifications"
+  ],
+  "idle": {
+    "lock": 300,
+    "screensaver": 150
+  },
+  "notifications": {
+    "monitors": [
+      "DP-2"
+    ]
+  },
+  "plugins": [
+    {
+      "baseColor": "#ffffff",
+      "breathPeriod": 8000,
+      "dim": 0.85,
+      "dots": 170,
+      "fps": 25,
+      "id": "user.gravity-field",
+      "interactionColor": "accent",
+      "linkDistance": 300,
+      "linkOpacity": 0.5,
+      "outputs": [],
+      "pauseWhenCovered": true,
+      "radius": 2.6,
+      "speed": 55
+    },
+    {
+      "id": "user.notifications"
+    }
+  ],
+  "version": 1
+}

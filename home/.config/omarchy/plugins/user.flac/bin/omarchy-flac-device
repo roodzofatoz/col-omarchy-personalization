@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# omarchy-flac-device — hand the DAC between PipeWire and mpv, and report who owns it.
+#
+#   omarchy-flac-device release [pw-device-name] [alsa-card-id]
+#       Save the device's active PipeWire profile, switch it to "off" so PipeWire
+#       closes the ALSA handle, and wait until the PCM reads "closed".
+#   omarchy-flac-device restore [pw-device-name] [alsa-card-id]
+#       Put the saved profile back (no-op when nothing was released).
+#   omarchy-flac-device outputs
+#       JSON list of hardware playback devices for the exclusive-mode chooser:
+#       [{"label","card","alsaDevice","pwDeviceName","description"}]
+#   omarchy-flac-device status  [pw-device-name] [alsa-card-id]
+#       JSON: {"owner":"mpv|pipewire|other|none","ownerPid":N,"state":"RUNNING|closed|...",
+#              "rate":N,"format":"S32_LE","bits":N,"released":bool,"graphRate":N}
+#
+# Nothing here is specific to the Topping E50 II beyond the defaults; both names
+# come from the widget settings. State lives in ~/.cache so a save inside the
+# plugin directory never triggers a shell plugin reload.
+set -uo pipefail
+
+cmd=${1:-status}
+PW_DEV=${2:-alsa_card.usb-Topping_E50_II-00}
+CARD=${3:-II}
+
+STATE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-flac
+STATE=$STATE_DIR/device-state.json
+mkdir -p "$STATE_DIR"
+
+pcm_dir() {
+  # /proc/asound/<card-id> is a symlink to cardN; pcm0p is the first playback PCM.
+  local d="/proc/asound/$CARD/pcm0p/sub0"
+  [[ -d $d ]] && echo "$d"
+}
+
+pw_device_id() {
+  pw-dump 2>/dev/null | python3 -c '
+import json, sys
+name = sys.argv[1]
+for o in json.load(sys.stdin):
+    if o.get("type") != "PipeWire:Interface:Device": continue
+    props = o.get("info", {}).get("props", {})
+    if props.get("device.name") == name:
+        active = ""
+        for p in o["info"].get("params", {}).get("Profile", []):
+            active = "%s:%s" % (p.get("index", 1), p.get("name", ""))
+        print(o["id"], active)
+        break
+' "$PW_DEV"
+}
+
+default_sink_name() {
+  wpctl inspect @DEFAULT_AUDIO_SINK@ 2>/dev/null | sed -n 's/.*node\.name = "\(.*\)"/\1/p' | head -1
+}
+
+sink_id_by_name() {
+  pw-dump 2>/dev/null | python3 -c '
+import json, sys
+name = sys.argv[1]
+for o in json.load(sys.stdin):
+    if o.get("type") != "PipeWire:Interface:Node": continue
+    props = o.get("info", {}).get("props", {})
+    if props.get("node.name") == name and props.get("media.class") == "Audio/Sink":
+        print(o["id"]); break
+' "$1"
+}
+
+status_json() {
+  local d owner_pid=0 state="none" rate=0 fmt="" bits=0 owner="none" comm="" released=false graph=0
+  d=$(pcm_dir)
+  if [[ -n $d ]]; then
+    state=$(sed -n 's/^state: *//p' "$d/status" | head -1)
+    [[ -z $state ]] && state=$(head -1 "$d/status")   # "closed"
+    owner_pid=$(sed -n 's/^owner_pid *: *//p' "$d/status" | head -1)
+    owner_pid=${owner_pid:-0}
+    if [[ $owner_pid -gt 0 ]]; then
+      comm=$(cat "/proc/$owner_pid/comm" 2>/dev/null || echo "")
+      case $comm in
+        mpv) owner=mpv ;;
+        pipewire*|wireplumber) owner=pipewire ;;
+        "") owner=none ;;
+        *) owner=other ;;
+      esac
+    fi
+    if [[ -f $d/hw_params ]] && ! grep -q '^closed' "$d/hw_params"; then
+      rate=$(sed -n 's/^rate: *\([0-9]*\).*/\1/p' "$d/hw_params" | head -1)
+      fmt=$(sed -n 's/^format: *//p' "$d/hw_params" | head -1)
+      case $fmt in
+        S16*|U16*) bits=16 ;;
+        S24_3*|U24_3*) bits=24 ;;
+        S24*|U24*) bits=24 ;;
+        S32*|U32*) bits=32 ;;
+        *) bits=0 ;;
+      esac
+    fi
+  fi
+  [[ -f $STATE ]] && released=true
+  graph=$(pw-metadata -n settings 0 clock.rate 2>/dev/null | sed -n "s/.*value:'\([0-9]*\)'.*/\1/p" | head -1)
+  printf '{"owner":"%s","ownerPid":%s,"state":"%s","rate":%s,"format":"%s","bits":%s,"released":%s,"graphRate":%s}\n' \
+    "$owner" "${owner_pid:-0}" "$state" "${rate:-0}" "$fmt" "$bits" "$released" "${graph:-0}"
+}
+
+case $cmd in
+  status)
+    status_json
+    ;;
+  outputs)
+    pw-dump 2>/dev/null | python3 -c '
+import json, os, re, sys
+# PipeWire device.name per ALSA card index, so a pick knows what to release.
+pw = {}
+try:
+    for o in json.load(sys.stdin):
+        if o.get("type") != "PipeWire:Interface:Device": continue
+        props = o.get("info", {}).get("props", {})
+        if props.get("device.api") != "alsa": continue
+        try: pw[int(props.get("api.alsa.card", -1))] = props.get("device.name", "")
+        except (TypeError, ValueError): pass
+except ValueError:
+    pass
+out = []
+try:
+    cards = open("/proc/asound/cards").read()
+except OSError:
+    cards = ""
+for m in re.finditer(r"^\s*(\d+)\s+\[(\S+)\s*\]:\s*(.*)$", cards, re.M):
+    idx, cid, desc = int(m.group(1)), m.group(2), m.group(3).strip()
+    base = "/proc/asound/card%d" % idx
+    try:
+        pcms = sorted(int(n[3:-1]) for n in os.listdir(base) if re.match(r"^pcm\d+p$", n))
+    except OSError:
+        pcms = []
+    for dev in pcms:
+        name = ""
+        try:
+            for line in open("%s/pcm%dp/info" % (base, dev)):
+                if line.startswith("name:"): name = line.split(":", 1)[1].strip()
+        except OSError:
+            pass
+        title = desc.split(" - ", 1)[-1]
+        out.append({
+            "label": title + (" — " + name if name and name.lower() not in title.lower() else ""),
+            "description": "hw:CARD=%s,DEV=%d" % (cid, dev) + (" · PipeWire: " + pw[idx] if idx in pw else " · not managed by PipeWire"),
+            "card": cid,
+            "alsaDevice": "alsa/hw:CARD=%s,DEV=%d" % (cid, dev),
+            "pwDeviceName": pw.get(idx, ""),
+        })
+json.dump(out, sys.stdout)
+print()
+'
+    ;;
+  release)
+    if [[ -f $STATE ]]; then
+      # Already released by us; nothing to do.
+      status_json; exit 0
+    fi
+    read -r id profile < <(pw_device_id)
+    if [[ -z ${id:-} ]]; then
+      echo "device $PW_DEV not found in PipeWire" >&2; exit 2
+    fi
+    # "index:name" of the active profile; wpctl only honours the index.
+    profile_index=${profile%%:*}; profile_name=${profile#*:}
+    [[ $profile_index =~ ^[0-9]+$ ]] || profile_index=1
+    [[ $profile_index -eq 0 ]] && profile_index=1
+    default_sink=$(default_sink_name)
+    printf '{"deviceName":"%s","profileIndex":%s,"profile":"%s","defaultSink":"%s"}\n' \
+      "$PW_DEV" "$profile_index" "${profile_name:-HiFi}" "$default_sink" > "$STATE"
+    if ! wpctl set-profile "$id" off; then
+      rm -f "$STATE"; echo "wpctl set-profile failed" >&2; exit 3
+    fi
+    d=$(pcm_dir)
+    for _ in $(seq 1 30); do
+      [[ -z $d ]] && break
+      head -1 "$d/status" | grep -q closed && break
+      sleep 0.1
+    done
+    status_json
+    ;;
+  restore)
+    if [[ ! -f $STATE ]]; then
+      status_json; exit 0
+    fi
+    read -r profile_index default_sink < <(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d.get("profileIndex", 1), d.get("defaultSink", ""))
+' "$STATE" 2>/dev/null || echo "1 ")
+    read -r id _ < <(pw_device_id)
+    if [[ -n ${id:-} ]]; then
+      wpctl set-profile "$id" "${profile_index:-1}"
+    fi
+    rm -f "$STATE"
+    # WirePlumber normally puts the sink back as default by itself; make sure.
+    if [[ -n ${default_sink:-} ]]; then
+      for _ in $(seq 1 30); do
+        sid=$(sink_id_by_name "$default_sink")
+        if [[ -n $sid ]]; then
+          [[ $(default_sink_name) == "$default_sink" ]] || wpctl set-default "$sid"
+          break
+        fi
+        sleep 0.1
+      done
+    fi
+    status_json
+    ;;
+  *)
+    echo "usage: omarchy-flac-device release|restore|status|outputs [pw-device-name] [alsa-card-id]" >&2
+    exit 1
+    ;;
+esac

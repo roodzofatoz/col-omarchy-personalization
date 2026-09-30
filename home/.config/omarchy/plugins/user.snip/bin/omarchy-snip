@@ -1,0 +1,122 @@
+#!/bin/bash
+# Region snip with a DARK overlay, straight to the clipboard.
+#
+# omarchy-capture-screenshot runs `slurp` with no colour arguments, so slurp
+# falls back to its built-in default background of #FFFFFF40 -- a white 25%
+# wash over everything outside the selection. That is the light tint this
+# replaces: here the area outside the selection is dimmed with the theme's
+# darkest background instead, the way the Windows and macOS snip overlays do
+# it, and the selection itself stays fully transparent so the region shows
+# its true colours.
+#
+# Everything else deliberately mirrors omarchy-capture-region so the snip
+# behaves like the stock screenshot: the screen is frozen first, hardware
+# cursors are forced on while grim runs, and the RETURN / CTRL+RETURN keys
+# that Omarchy binds to the slurp layer keep working.
+
+set -uo pipefail
+
+SAVE=false
+[[ ${1:-} == "--save" ]] && SAVE=true
+
+# A second invocation while a picker is open cancels it, matching the stock
+# screenshot binding.
+if pkill -x slurp 2>/dev/null; then exit 0; fi
+
+# ------------------------------------------------------------------- colours
+
+THEME_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/current/theme"
+
+theme_color() { # key fallback
+  local value
+  value=$(sed -n "s/^$1[[:space:]]*=[[:space:]]*\"\(#[0-9a-fA-F]\{6\}\)\".*/\1/p" \
+    "$THEME_DIR/colors.toml" 2>/dev/null | head -1)
+  printf '%s' "${value:-$2}"
+}
+
+# b3 = 70% opacity: dark enough to read as "not selected", light enough that
+# you can still see what you are aiming at.
+DIM="$(theme_color darker_background '#06060c')b3"
+BORDER="$(theme_color accent '#ddf7ff')ff"
+CLEAR="#00000000"
+
+# --------------------------------------------------------------- freeze/grab
+
+FULLSCREEN_MARKER="${XDG_RUNTIME_DIR:-/tmp}/omarchy-capture-region-fullscreen"
+WINDOW_MARKER="${XDG_RUNTIME_DIR:-/tmp}/omarchy-capture-region-window"
+
+NO_HW_CURSORS=$(hyprctl getoption cursor:no_hardware_cursors -j 2>/dev/null | jq '.int')
+
+set_no_hw_cursors() {
+  hyprctl eval "hl.config({ cursor = { no_hardware_cursors = $1 } })" &>/dev/null ||
+    hyprctl keyword cursor:no_hardware_cursors "$1" &>/dev/null
+}
+
+cleanup() {
+  [[ -n ${FREEZE_PID:-} ]] && kill "$FREEZE_PID" 2>/dev/null
+  [[ -n ${NO_HW_CURSORS:-} ]] && set_no_hw_cursors "$NO_HW_CURSORS"
+}
+trap cleanup EXIT
+
+# Software-composited cursors get baked into grim's frames, so force hardware
+# cursors until after the capture.
+set_no_hw_cursors 0
+
+hyprpicker -r -z >/dev/null 2>&1 &
+FREEZE_PID=$!
+sleep .1
+
+# The smallest window under the cursor on the active workspace, for the
+# RETURN key. Mirrors omarchy-capture-region's geo_at_cursor.
+geo_at_cursor() {
+  local pos x y ws
+  pos=$(hyprctl cursorpos 2>/dev/null) || return 1
+  x=${pos%,*}
+  y=${pos#*, }
+  ws=$(hyprctl monitors -j | jq -r '.[] | select(.focused == true) | .activeWorkspace.id')
+  hyprctl clients -j | jq -r --argjson x "$x" --argjson y "$y" --arg ws "$ws" '
+    [ .[]
+      | select(.workspace.id == ($ws | tonumber) and .hidden != true)
+      | select(.at[0] <= $x and $x < .at[0] + .size[0]
+           and .at[1] <= $y and $y < .at[1] + .size[1])
+      | { area: (.size[0] * .size[1]),
+          geo: "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])" } ]
+    | sort_by(.area) | (.[0].geo // empty)'
+}
+
+rm -f "$FULLSCREEN_MARKER" "$WINDOW_MARKER"
+SELECTION=$(slurp -b "$DIM" -c "$BORDER" -s "$CLEAR" 2>/dev/null)
+
+# An empty result plus a marker means one of Omarchy's slurp keybinds fired
+# instead of a drag.
+if [[ -z $SELECTION && -e $FULLSCREEN_MARKER ]]; then
+  rm -f "$FULLSCREEN_MARKER"
+  SELECTION=$(omarchy-capture-region fullscreen)
+elif [[ -z $SELECTION && -e $WINDOW_MARKER ]]; then
+  rm -f "$WINDOW_MARKER"
+  SELECTION=$(geo_at_cursor)
+  [[ -n $SELECTION ]] || SELECTION=$(omarchy-capture-region fullscreen)
+fi
+
+[[ -n $SELECTION ]] || exit 0
+
+# ------------------------------------------------------------------- capture
+
+if [[ $SAVE == true ]]; then
+  [[ -f ~/.config/user-dirs.dirs ]] && source ~/.config/user-dirs.dirs
+  OUTPUT_DIR="${OMARCHY_SCREENSHOT_DIR:-${XDG_PICTURES_DIR:-$HOME/Pictures}}"
+  mkdir -p "$OUTPUT_DIR"
+  FILEPATH="$OUTPUT_DIR/screenshot-$(date +'%Y-%m-%d_%H-%M-%S').png"
+
+  grim -g "$SELECTION" "$FILEPATH" || exit 1
+  wl-copy --type image/png <"$FILEPATH"
+
+  # Best effort: the snip is already saved and on the clipboard, so a
+  # notification outage must not report the capture itself as failed.
+  omarchy-notification-send "Snip saved to clipboard and file" \
+    "Edit with Super + Alt + , (or click this)" \
+    --image "$FILEPATH" \
+    --exec "${OMARCHY_SCREENSHOT_EDITOR:-tensaku-edit}" "$FILEPATH" || true
+else
+  grim -g "$SELECTION" - | wl-copy --type image/png
+fi

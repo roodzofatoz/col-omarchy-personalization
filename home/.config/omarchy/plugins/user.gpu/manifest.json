@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "id": "user.gpu",
+  "name": "GPU Drivers",
+  "version": "1.0.0",
+  "author": "user",
+  "description": "Checks for GPU driver updates (repo + AUR), shows the loaded driver vs the installed one, and flags when a reboot is needed",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Engine.qml",
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "GPU Drivers",
+    "description": "Bar icon lights up when a GPU driver update is pending or the loaded driver no longer matches the installed one. Panel shows GPU, driver versions, pending updates and an Update button.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "checkHours": 6,
+      "checkUpstream": true,
+      "hideWhenCurrent": false
+    },
+    "schema": [
+      {
+        "key": "checkHours",
+        "type": "number",
+        "label": "Check interval (hours)",
+        "defaultValue": 6
+      },
+      {
+        "key": "checkUpstream",
+        "type": "boolean",
+        "label": "Also look up NVIDIA's latest release on nvidia.com",
+        "defaultValue": true
+      },
+      {
+        "key": "hideWhenCurrent",
+        "type": "boolean",
+        "label": "Hide the bar icon while everything is up to date",
+        "defaultValue": false
+      }
+    ]
+  }
+}

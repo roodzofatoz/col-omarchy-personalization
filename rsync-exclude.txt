@@ -1,0 +1,14 @@
+# rsync --exclude-from patterns applied to every directory entry in manifest.txt
+.git/
+__pycache__/
+*.pyc
+*.bak
+*.bak.*
+*.omarchy-upgrade-to-*
+.uuid
+# user.a75: decompiled vendor bundle and agent-session scaffolding stay out of the repo
+/user.a75/reference/
+/user.a75/docs/superpowers/
+/user.a75/.superpowers/
+# nvim runtime state
+/lazy-lock.json.bak

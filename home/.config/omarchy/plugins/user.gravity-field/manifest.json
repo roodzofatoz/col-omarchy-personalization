@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "user.gravity-field",
+  "name": "Dot Field",
+  "version": "2.0.0",
+  "author": "user",
+  "description": "Small dots bouncing elastically off each other, drawn as one continuous world across every monitor",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "GravityField.qml"
+  }
+}

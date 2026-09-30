@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""Fixed-zone window grid for Hyprland ("FancyZones"-style).
+
+Each configured monitor is carved into rows, and each row into columns. Zones
+are numbered row-major starting at 1. Snapping a window floats it and gives it
+the zone's exact geometry, so the layout stays put no matter what else opens.
+
+Config: ~/.config/omarchy/grid.json
+    {
+      "monitors": {
+        "DP-1":     { "rows": [2, 2, 1] },   3 rows: 2 cols, 2 cols, 1 col
+        "HDMI-A-1": { "rows": [1, 1, 1] }    3 rows, full width each
+      }
+    }
+
+Optional per-monitor "weights" (one number per row) makes rows uneven; the
+default is equal heights. Gaps follow Hyprland's general:gaps_in/gaps_out.
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+CONFIG = os.path.expanduser("~/.config/omarchy/grid.json")
+DEFAULT_CONFIG = {
+    "monitors": {
+        "DP-1": {"rows": [2, 2, 1]},
+        "HDMI-A-1": {"rows": [1, 1, 1]},
+    }
+}
+
+
+# --------------------------------------------------------------- hyprland IO
+
+def hypr(*args):
+    out = subprocess.run(
+        ["hyprctl", "-j"] + list(args), capture_output=True, text=True, check=True
+    )
+    return json.loads(out.stdout)
+
+
+def dispatch(batch):
+    """Run several dispatchers in one round trip so the window moves once.
+
+    Hyprland's Lua config provider evaluates `hyprctl dispatch <x>` as
+    `hl.dispatch(<x>)`, so dispatchers are written as `hl.dsp.*` calls rather
+    than the old `movewindowpixel exact ...` strings.
+    """
+    if not batch:
+        return
+    subprocess.run(
+        ["hyprctl", "--batch", ";".join("dispatch " + c for c in batch)],
+        capture_output=True,
+        text=True,
+    )
+
+
+def dsp_float(address, enabled):
+    return 'hl.dsp.window.float({ window = "address:%s", action = "%s" })' % (
+        address,
+        "enable" if enabled else "disable",
+    )
+
+
+def dsp_place(address, zone):
+    """Float the window, then give it the zone's exact size and position."""
+    return [
+        dsp_float(address, True),
+        'hl.dsp.window.resize({ window = "address:%s", x = %d, y = %d, relative = false })'
+        % (address, zone["w"], zone["h"]),
+        'hl.dsp.window.move({ window = "address:%s", x = %d, y = %d, relative = false })'
+        % (address, zone["x"], zone["y"]),
+    ]
+
+
+def option_int(name, fallback):
+    try:
+        value = hypr("getoption", name)
+    except Exception:
+        return fallback
+    # Gap options come back as CSS-style "custom" data; scalars use "int".
+    if isinstance(value.get("custom"), str) and value["custom"].strip():
+        parts = value["custom"].split()
+        if parts:
+            try:
+                return int(float(parts[0]))
+            except ValueError:
+                pass
+    for key in ("int", "value"):
+        if isinstance(value.get(key), (int, float)):
+            return int(value[key])
+    return fallback
+
+
+# ------------------------------------------------------------------- config
+
+def load_config():
+    if not os.path.exists(CONFIG):
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        with open(CONFIG, "w") as fh:
+            json.dump(DEFAULT_CONFIG, fh, indent=2)
+            fh.write("\n")
+        return DEFAULT_CONFIG
+    with open(CONFIG) as fh:
+        return json.load(fh)
+
+
+# -------------------------------------------------------------------- zones
+
+def logical_rect(monitor):
+    """Monitor position and size in logical (post-scale, post-rotation) pixels."""
+    scale = monitor.get("scale") or 1
+    width, height = monitor["width"], monitor["height"]
+    if monitor.get("transform", 0) in (1, 3, 5, 7):  # 90/270 rotations swap axes
+        width, height = height, width
+    return monitor["x"], monitor["y"], int(round(width / scale)), int(round(height / scale))
+
+
+def zones_for(monitor, spec, gaps_in, gaps_out):
+    rows = [max(1, int(n)) for n in spec.get("rows", [])]
+    if not rows:
+        return []
+    weights = spec.get("weights") or [1] * len(rows)
+    if len(weights) != len(rows):
+        weights = [1] * len(rows)
+    total_weight = float(sum(weights)) or 1.0
+
+    x, y, width, height = logical_rect(monitor)
+    # reserved is [left, top, right, bottom] — space already claimed by the bar.
+    left, top, right, bottom = (monitor.get("reserved") or [0, 0, 0, 0])[:4]
+    x += left
+    y += top
+    width -= left + right
+    height -= top + bottom
+
+    # Each zone is inset by gaps_in, so shrinking the field by (gaps_out -
+    # gaps_in) leaves gaps_out at the screen edge and 2*gaps_in between zones —
+    # the same rhythm Hyprland gives tiled windows.
+    edge = gaps_out - gaps_in
+    x += edge
+    y += edge
+    width -= 2 * edge
+    height -= 2 * edge
+
+    zones = []
+    cursor = 0
+    for index, columns in enumerate(rows):
+        # Distribute by accumulated position so rounding never leaves a seam.
+        next_cursor = cursor + weights[index]
+        row_top = y + int(round(height * cursor / total_weight))
+        row_bottom = y + int(round(height * next_cursor / total_weight))
+        cursor = next_cursor
+        for column in range(columns):
+            col_left = x + int(round(width * column / columns))
+            col_right = x + int(round(width * (column + 1) / columns))
+            zones.append(
+                {
+                    "x": col_left + gaps_in,
+                    "y": row_top + gaps_in,
+                    "w": col_right - col_left - 2 * gaps_in,
+                    "h": row_bottom - row_top - 2 * gaps_in,
+                    "row": index + 1,
+                    "col": column + 1,
+                }
+            )
+    return zones
+
+
+def grid_state():
+    """Every configured monitor with its zones, keyed by output name."""
+    config = load_config()
+    specs = config.get("monitors") or {}
+    gaps_in = option_int("general:gaps_in", 5)
+    gaps_out = option_int("general:gaps_out", 10)
+    grids = {}
+    for monitor in hypr("monitors"):
+        spec = specs.get(monitor["name"])
+        if not spec:
+            continue
+        grids[monitor["name"]] = {
+            "monitor": monitor,
+            "zones": zones_for(monitor, spec, gaps_in, gaps_out),
+        }
+    return grids
+
+
+# ------------------------------------------------------------------ windows
+
+def monitor_names():
+    return {monitor["id"]: monitor["name"] for monitor in hypr("monitors")}
+
+
+def settle(placements, tolerance=2):
+    """Re-assert the top-left corner of anything that did not land where we
+    asked. A client with a minimum size larger than its zone gets grown and
+    re-centred by Hyprland, which can push it off the edge of the screen;
+    pinning the corner back keeps the overflow inside the monitor instead.
+    """
+    if not placements:
+        return
+    time.sleep(0.25)
+    clients = {c.get("address"): c for c in hypr("clients")}
+    batch = []
+    for address, zone in placements:
+        client = clients.get(address)
+        if not client:
+            continue
+        at = client.get("at") or [0, 0]
+        if abs(at[0] - zone["x"]) <= tolerance and abs(at[1] - zone["y"]) <= tolerance:
+            continue
+        batch.append(
+            'hl.dsp.window.move({ window = "address:%s", x = %d, y = %d, relative = false })'
+            % (address, zone["x"], zone["y"])
+        )
+    dispatch(batch)
+
+
+def place(address, zone):
+    dispatch(dsp_place(address, zone))
+    settle([(address, zone)])
+
+
+def occupies(client, zone, slack=40):
+    at, size = client.get("at") or [0, 0], client.get("size") or [0, 0]
+    return (
+        abs(at[0] - zone["x"]) <= slack
+        and abs(at[1] - zone["y"]) <= slack
+        and abs(size[0] - zone["w"]) <= slack
+        and abs(size[1] - zone["h"]) <= slack
+    )
+
+
+def tileable(client):
+    """Skip anything that is not a normal, visible application window."""
+    return (
+        client.get("mapped")
+        and not client.get("hidden")
+        and client.get("workspace", {}).get("id", -1) > 0
+        and (client.get("size") or [0, 0])[0] > 0
+    )
+
+
+def windows_on(name, workspace_id=None):
+    names = monitor_names()
+    clients = []
+    for client in hypr("clients"):
+        if names.get(client.get("monitor")) != name or not tileable(client):
+            continue
+        if workspace_id is not None and client["workspace"]["id"] != workspace_id:
+            continue
+        clients.append(client)
+    # Stable order so `arrange` is repeatable rather than following focus history.
+    clients.sort(key=lambda c: ((c.get("at") or [0, 0])[1], (c.get("at") or [0, 0])[0]))
+    return clients
+
+
+BLOCK_SIZE = 10
+
+
+def occupied_zones(name, workspace_id, zones, exclude=()):
+    """Map zone index -> the window sitting in it, ignoring `exclude`."""
+    taken = {}
+    for client in windows_on(name, workspace_id):
+        if client["address"] in exclude:
+            continue
+        for index, zone in enumerate(zones):
+            if index not in taken and occupies(client, zone):
+                taken[index] = client
+                break
+    return taken
+
+
+def nearest_zone(client, zones):
+    """Index of the zone whose centre is closest to the window's centre."""
+    at, size = client.get("at") or [0, 0], client.get("size") or [0, 0]
+    cx, cy = at[0] + size[0] / 2.0, at[1] + size[1] / 2.0
+    best, best_distance = 0, None
+    for index, zone in enumerate(zones):
+        zx, zy = zone["x"] + zone["w"] / 2.0, zone["y"] + zone["h"] / 2.0
+        distance = (cx - zx) ** 2 + (cy - zy) ** 2
+        if best_distance is None or distance < best_distance:
+            best, best_distance = index, distance
+    return best
+
+
+def page_ids(workspace_id):
+    """Every workspace id in this monitor's block, starting after the current
+    one and wrapping, i.e. the pages to try when this one is full."""
+    base = ((workspace_id - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    relative = workspace_id - base
+    order = list(range(relative + 1, BLOCK_SIZE + 1)) + list(range(1, relative))
+    return [base + n for n in order]
+
+
+def displace(client, name, workspace_id, zones, exclude, avoid):
+    """Move a window out of a zone someone else is claiming: into the first
+    free zone on this page, or onto the next page that still has room.
+
+    `avoid` is the zone the incoming window is taking, so the occupant is
+    never handed back the very zone it is being evicted from.
+    """
+    taken = occupied_zones(name, workspace_id, zones, exclude=exclude)
+    free = [i for i in range(len(zones)) if i not in taken and i != avoid]
+    if free:
+        return dsp_place(client["address"], zones[free[0]])
+
+    for page in page_ids(workspace_id):
+        taken = occupied_zones(name, page, zones)
+        free = [i for i in range(len(zones)) if i not in taken]
+        if free:
+            return [
+                'hl.dsp.window.move({ window = "address:%s", workspace = "%d", follow = false })'
+                % (client["address"], page)
+            ] + dsp_place(client["address"], zones[free[0]])
+
+    # Every page in the block is full; park it on the next one regardless.
+    return [
+        'hl.dsp.window.move({ window = "address:%s", workspace = "%d", follow = false })'
+        % (client["address"], page_ids(workspace_id)[0])
+    ]
+
+
+def focused_monitor_name():
+    for monitor in hypr("monitors"):
+        if monitor.get("focused"):
+            return monitor["name"]
+    return None
+
+
+# ----------------------------------------------------------------- commands
+
+def cmd_zones(argv):
+    grids = grid_state()
+    if not grids:
+        print("No grid configured for any connected monitor. See " + CONFIG)
+        return 1
+    only = argv[0] if argv else None
+    for name, grid in grids.items():
+        if only and name != only:
+            continue
+        print("%s (%dx%d at %d,%d)" % ((name,) + logical_rect(grid["monitor"])[2:4] + tuple(logical_rect(grid["monitor"])[0:2])))
+        for index, zone in enumerate(grid["zones"], 1):
+            print(
+                "  zone %d  row %d col %d   %4dx%-4d at %d,%d"
+                % (index, zone["row"], zone["col"], zone["w"], zone["h"], zone["x"], zone["y"])
+            )
+    return 0
+
+
+def cmd_snap(argv):
+    if not argv:
+        print("usage: omarchy-grid snap <zone-number>", file=sys.stderr)
+        return 2
+    try:
+        index = int(argv[0])
+    except ValueError:
+        print("zone must be a number", file=sys.stderr)
+        return 2
+
+    active = hypr("activewindow")
+    if not active or not active.get("address"):
+        return 0
+    name = monitor_names().get(active.get("monitor"))
+    grid = grid_state().get(name)
+    if not grid:
+        print("No grid configured for %s" % name, file=sys.stderr)
+        return 1
+    zones = grid["zones"]
+    if not 1 <= index <= len(zones):
+        print("%s has zones 1-%d" % (name, len(zones)), file=sys.stderr)
+        return 1
+    place(active["address"], zones[index - 1])
+    return 0
+
+
+def cmd_arrange(argv):
+    grids = grid_state()
+    name = argv[0] if argv else focused_monitor_name()
+    grid = grids.get(name)
+    if not grid:
+        print("No grid configured for %s" % name, file=sys.stderr)
+        return 1
+    workspace = grid["monitor"].get("activeWorkspace", {}).get("id")
+    zones = grid["zones"]
+    batch, placements = [], []
+    for index, client in enumerate(windows_on(name, workspace)):
+        # More windows than zones: stack the overflow into the last zone.
+        zone = zones[min(index, len(zones) - 1)]
+        batch += dsp_place(client["address"], zone)
+        placements.append((client["address"], zone))
+    dispatch(batch)
+    settle(placements)
+    return 0
+
+
+def cmd_snap_nearest(argv):
+    """Snap a window to the zone it was dropped nearest, pushing whatever was
+    already there into the next free zone (or the next workspace page)."""
+    if argv:
+        address = argv[0]
+        client = next((c for c in hypr("clients") if c.get("address") == address), None)
+    else:
+        client = hypr("activewindow")
+    if not client or not client.get("address") or not tileable(client):
+        return 0
+
+    name = monitor_names().get(client.get("monitor"))
+    grid = grid_state().get(name)
+    if not grid:  # monitors without a grid keep normal drag behaviour
+        return 0
+
+    zones = grid["zones"]
+    workspace_id = client["workspace"]["id"]
+    target = nearest_zone(client, zones)
+
+    batch = []
+    occupant = occupied_zones(name, workspace_id, zones, exclude=(client["address"],)).get(target)
+    if occupant:
+        batch += displace(
+            occupant,
+            name,
+            workspace_id,
+            zones,
+            exclude=(client["address"], occupant["address"]),
+            avoid=target,
+        )
+    batch += dsp_place(client["address"], zones[target])
+    dispatch(batch)
+    settle([(client["address"], zones[target])])
+    return 0
+
+
+def cmd_unsnap(argv):
+    """No argument releases the focused window; a monitor name or `all`
+    releases every window on that monitor back to normal tiling."""
+    target = argv[0] if argv else None
+    if not target:
+        active = hypr("activewindow")
+        if active and active.get("address"):
+            dispatch([dsp_float(active["address"], False)])
+        return 0
+
+    names = list(grid_state()) if target == "all" else [target]
+    batch = []
+    for name in names:
+        for client in windows_on(name):
+            if client.get("floating"):
+                batch.append(dsp_float(client["address"], False))
+    dispatch(batch)
+    return 0
+
+
+def claim_single_instance():
+    """Hold an abstract unix socket name for as long as this process lives, so
+    a second watcher (a Hyprland restart re-running autostart, say) exits
+    instead of double-placing every new window."""
+    guard = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        guard.bind("\0omarchy-grid-watch-%d" % os.getuid())
+    except OSError:
+        return None
+    return guard
+
+
+def cmd_watch(argv):
+    """Place each newly opened window into the emptiest free zone."""
+    guard = claim_single_instance()
+    if guard is None:
+        print("omarchy-grid watch is already running", file=sys.stderr)
+        return 0
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+    path = os.path.join(runtime, "hypr", signature or "", ".socket2.sock")
+    if not signature or not os.path.exists(path):
+        print("Hyprland event socket not found at %s" % path, file=sys.stderr)
+        return 1
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(path)
+    buffer = ""
+    while True:
+        chunk = sock.recv(4096).decode("utf-8", "replace")
+        if not chunk:
+            return 0
+        buffer += chunk
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            if not line.startswith("openwindow>>"):
+                continue
+            address = "0x" + line.split(">>", 1)[1].split(",")[0]
+            try:
+                autoplace(address)
+            except Exception as error:  # never let one bad window kill the daemon
+                print("omarchy-grid: %s" % error, file=sys.stderr)
+
+
+def autoplace(address):
+    client = next(
+        (c for c in hypr("clients") if c.get("address") == address), None
+    )
+    if not client or not tileable(client):
+        return
+    # A window that asked to float (dialogs, pickers, popups) keeps its own size.
+    if client.get("floating"):
+        return
+    name = monitor_names().get(client.get("monitor"))
+    grid = grid_state().get(name)
+    if not grid:
+        return
+    zones = grid["zones"]
+    others = [
+        c for c in windows_on(name, client["workspace"]["id"])
+        if c["address"] != address
+    ]
+    counts = [sum(1 for c in others if occupies(c, zone)) for zone in zones]
+    place(address, zones[counts.index(min(counts))])
+
+
+COMMANDS = {
+    "zones": cmd_zones,
+    "snap": cmd_snap,
+    "arrange": cmd_arrange,
+    "unsnap": cmd_unsnap,
+    "snap-nearest": cmd_snap_nearest,
+    "watch": cmd_watch,
+}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        print(__doc__)
+        print("commands: " + ", ".join(sorted(COMMANDS)))
+        sys.exit(2)
+    sys.exit(COMMANDS[sys.argv[1]](sys.argv[2:]))

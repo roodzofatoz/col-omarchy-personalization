@@ -1,0 +1,9 @@
+{
+  "_comment": "Per-monitor workspace sets. Each monitor owns `size` workspace ids starting at `base` + 1, but the bar and the SUPER+<n> keys address them as 1-N. Keep these bases in sync with the workspace rules in ~/.config/hypr/monitors.lua.",
+  "size": 10,
+  "bases": {
+    "DP-1": 0,
+    "DP-2": 10,
+    "HDMI-A-1": 20
+  }
+}

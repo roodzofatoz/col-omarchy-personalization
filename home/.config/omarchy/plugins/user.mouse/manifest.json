@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "id": "user.mouse",
+  "name": "Mouse",
+  "version": "1.0.0",
+  "author": "user",
+  "description": "Mouse battery, DPI, and polling rate, with a pointer-acceleration switch",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Mouse",
+    "description": "Battery level, DPI and polling rate for the connected mouse, plus a switch for pointer acceleration. Left = popup, right = toggle acceleration, middle = toggle the bar percentage.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showPercentage": false,
+      "refreshIntervalSec": 120
+    },
+    "schema": [
+      {
+        "key": "showPercentage",
+        "type": "boolean",
+        "label": "Show battery percentage in the bar",
+        "defaultValue": false
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 15,
+        "max": 900,
+        "step": 15,
+        "defaultValue": 120,
+        "description": "How often the mouse is polled while the popup is closed."
+      }
+    ]
+  }
+}

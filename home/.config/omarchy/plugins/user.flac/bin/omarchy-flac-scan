@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""omarchy-flac-scan — build a JSON library index of every .flac under a directory.
+
+    omarchy-flac-scan <dir> [--force]
+
+Reads STREAMINFO + VORBIS_COMMENT straight from the FLAC container (no
+external tools), caches per-file results in ~/.cache/omarchy-flac/library.json
+keyed on (mtime, size), and prints:
+
+    {"dir": "...", "count": N,
+     "albums": [{"key", "album", "albumartist", "year", "dir",
+                 "tracks": [{"path","title","artist","album","genre","disc","track",
+                             "rate","bps","channels","duration"}]}]}
+
+Sorted by albumartist / year / album / disc / track.
+"""
+import hashlib
+import json
+import os
+import struct
+import sys
+
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "omarchy-flac")
+CACHE = os.path.join(CACHE_DIR, "library.json")
+ART_DIR = os.path.join(CACHE_DIR, "art")
+ART_NAMES = ("cover", "folder", "front", "album", "albumart", "artwork")
+ART_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def folder_art(directory):
+    """A cover image sitting next to the tracks, if any."""
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return ""
+    lower = {n.lower(): n for n in names}
+    for base in ART_NAMES:
+        for ext in ART_EXTS:
+            n = lower.get(base + ext)
+            if n:
+                return os.path.join(directory, n)
+    for n in names:
+        if n.lower().endswith(ART_EXTS):
+            return os.path.join(directory, n)
+    return ""
+
+
+def embedded_art(path):
+    """Extract the front-cover PICTURE block of a FLAC file into the art cache.
+
+    Returns the cached file path, or "" when the file carries no picture."""
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"fLaC":
+                return ""
+            best = None
+            while True:
+                hdr = f.read(4)
+                if len(hdr) < 4:
+                    break
+                last = hdr[0] & 0x80
+                btype = hdr[0] & 0x7F
+                length = (hdr[1] << 16) | (hdr[2] << 8) | hdr[3]
+                if btype == 6:
+                    body = f.read(length)
+                    try:
+                        pos = 0
+                        (ptype,) = struct.unpack_from(">I", body, pos); pos += 4
+                        (mlen,) = struct.unpack_from(">I", body, pos); pos += 4
+                        mime = body[pos:pos + mlen].decode("ascii", "replace"); pos += mlen
+                        (dlen,) = struct.unpack_from(">I", body, pos); pos += 4 + dlen
+                        pos += 4 * 4
+                        (plen,) = struct.unpack_from(">I", body, pos); pos += 4
+                        data = body[pos:pos + plen]
+                        # Prefer the front cover (type 3); otherwise the first picture.
+                        if data and (best is None or ptype == 3):
+                            best = (mime, data)
+                            if ptype == 3:
+                                break
+                    except struct.error:
+                        pass
+                else:
+                    f.seek(length, 1)
+                if last:
+                    break
+    except OSError:
+        return ""
+    if not best:
+        return ""
+    mime, data = best
+    ext = ".png" if "png" in mime else (".webp" if "webp" in mime else ".jpg")
+    os.makedirs(ART_DIR, exist_ok=True)
+    out = os.path.join(ART_DIR, hashlib.sha1(path.encode("utf-8", "replace")).hexdigest() + ext)
+    if not os.path.exists(out):
+        tmp = out + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, out)
+    return out
+
+
+def read_flac(path):
+    """Return dict with stream info + tags, or None if not a FLAC file."""
+    with open(path, "rb") as f:
+        if f.read(4) != b"fLaC":
+            return None
+        info = {}
+        tags = {}
+        while True:
+            hdr = f.read(4)
+            if len(hdr) < 4:
+                break
+            last = hdr[0] & 0x80
+            btype = hdr[0] & 0x7F
+            length = (hdr[1] << 16) | (hdr[2] << 8) | hdr[3]
+            body = f.read(length)
+            if btype == 0 and len(body) >= 18:
+                bits = int.from_bytes(body[10:18], "big")
+                info["rate"] = bits >> 44
+                info["channels"] = ((bits >> 41) & 0x7) + 1
+                info["bps"] = ((bits >> 36) & 0x1F) + 1
+                info["samples"] = bits & ((1 << 36) - 1)
+            elif btype == 4:
+                try:
+                    pos = 0
+                    (vlen,) = struct.unpack_from("<I", body, pos); pos += 4 + vlen
+                    (count,) = struct.unpack_from("<I", body, pos); pos += 4
+                    for _ in range(count):
+                        (clen,) = struct.unpack_from("<I", body, pos); pos += 4
+                        entry = body[pos:pos + clen].decode("utf-8", "replace"); pos += clen
+                        if "=" in entry:
+                            k, v = entry.split("=", 1)
+                            k = k.upper()
+                            if k not in tags:
+                                tags[k] = v
+                except struct.error:
+                    pass
+            if last:
+                break
+        if "rate" not in info:
+            return None
+        info["tags"] = tags
+        return info
+
+
+def to_int(value, default=0):
+    try:
+        return int(str(value).split("/")[0].strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def track_entry(path, info):
+    t = info["tags"]
+    rate = info["rate"] or 1
+    fname = os.path.splitext(os.path.basename(path))[0]
+    return {
+        "path": path,
+        "title": t.get("TITLE") or fname,
+        "artist": t.get("ARTIST") or t.get("ALBUMARTIST") or "",
+        "albumartist": t.get("ALBUMARTIST") or t.get("ARTIST") or "",
+        "album": t.get("ALBUM") or os.path.basename(os.path.dirname(path)),
+        "year": (t.get("DATE") or t.get("YEAR") or "")[:4],
+        "genre": t.get("GENRE") or "",
+        "disc": to_int(t.get("DISCNUMBER"), 1),
+        "track": to_int(t.get("TRACKNUMBER"), 0),
+        "rate": info["rate"],
+        "bps": info["bps"],
+        "channels": info["channels"],
+        "duration": round(info["samples"] / rate, 3),
+    }
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    force = "--force" in sys.argv
+    root = os.path.expanduser(args[0] if args else "~/Music")
+    root = os.path.abspath(root)
+
+    cache = {}
+    if not force:
+        try:
+            with open(CACHE) as f:
+                cache = json.load(f).get("files", {})
+        except (OSError, ValueError):
+            cache = {}
+
+    files = {}
+    missing = not os.path.isdir(root)
+    if not missing:
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+            dirnames.sort()
+            for name in sorted(filenames):
+                if not name.lower().endswith(".flac"):
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                key = "v2:%d:%d" % (int(st.st_mtime), st.st_size)
+                cached = cache.get(path)
+                if cached and cached.get("key") == key:
+                    files[path] = cached
+                    continue
+                try:
+                    info = read_flac(path)
+                except OSError:
+                    info = None
+                if not info:
+                    continue
+                files[path] = {"key": key, "track": track_entry(path, info)}
+
+    albums = {}
+    for path, rec in files.items():
+        t = rec["track"]
+        akey = "%s\x1f%s\x1f%s" % (os.path.dirname(path), t["albumartist"].lower(), t["album"].lower())
+        a = albums.get(akey)
+        if a is None:
+            a = albums[akey] = {
+                "key": akey,
+                "album": t["album"],
+                "albumartist": t["albumartist"],
+                "year": t["year"],
+                "dir": os.path.dirname(path),
+                "tracks": [],
+            }
+        a["tracks"].append(t)
+
+    # Album art is resolved once per album and remembered in the cache so a
+    # rescan does not re-read 11k files' picture blocks.
+    art_cache = {}
+    if not force:
+        try:
+            with open(CACHE) as f:
+                art_cache = json.load(f).get("art", {})
+        except (OSError, ValueError):
+            art_cache = {}
+    art_out = {}
+    out = []
+    for a in albums.values():
+        a["tracks"].sort(key=lambda t: (t["disc"], t["track"], t["title"].lower(), t["path"]))
+        first = a["tracks"][0]["path"]
+        cached = art_cache.get(first)
+        if cached is not None and (cached == "" or os.path.exists(cached)):
+            art = cached
+        else:
+            art = folder_art(a["dir"]) or embedded_art(first)
+        art_out[first] = art
+        a["art"] = art
+        out.append(a)
+    out.sort(key=lambda a: (a["albumartist"].lower(), a["year"], a["album"].lower(), a["dir"]))
+
+    # An unmounted drive or a wrong pick must not wipe a good cache: only
+    # write it back when the scan actually found something.
+    if files:
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            tmp = CACHE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"files": files, "art": art_out}, f)
+            os.replace(tmp, CACHE)
+        except OSError:
+            pass
+
+    json.dump({"dir": root, "missing": missing, "count": len(files), "albums": out}, sys.stdout)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "user.devsrv",
+  "name": "Dev Servers",
+  "version": "1.0.0",
+  "author": "user",
+  "description": "Running local dev servers and the ones you ran before: re-run, stop, open the project folder, open in the browser",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Engine.qml",
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Dev Servers",
+    "description": "Bar counter of running local instances; the panel lists them with stop / folder / browser / logs actions and a history of earlier runs you can start again.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "pollSeconds": 5,
+      "showDotsInBar": true,
+      "historyLimit": 30
+    },
+    "schema": [
+      {
+        "key": "pollSeconds",
+        "type": "number",
+        "label": "Rescan interval (seconds)",
+        "defaultValue": 5,
+        "description": "How often listening ports are rescanned while the panel is closed. The open panel rescans every 1.5 s."
+      },
+      {
+        "key": "showDotsInBar",
+        "type": "boolean",
+        "label": "Show one dot per running instance under the icon",
+        "defaultValue": true
+      },
+      {
+        "key": "historyLimit",
+        "type": "number",
+        "label": "Recent instances to show",
+        "defaultValue": 30
+      }
+    ]
+  }
+}

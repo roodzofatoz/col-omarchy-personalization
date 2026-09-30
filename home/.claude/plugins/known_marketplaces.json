@@ -1,0 +1,58 @@
+{
+  "claude-plugins-official": {
+    "source": {
+      "source": "github",
+      "repo": "anthropics/claude-plugins-official"
+    },
+    "installLocation": "/home/user/.claude/plugins/marketplaces/claude-plugins-official",
+    "lastUpdated": "2026-09-30T13:27:59.178Z"
+  },
+  "pilotfish": {
+    "source": {
+      "source": "github",
+      "repo": "Nanako0129/pilotfish"
+    },
+    "installLocation": "/home/user/.claude/plugins/marketplaces/pilotfish",
+    "lastUpdated": "2026-08-27T13:03:01.296Z"
+  },
+  "claude-community": {
+    "source": {
+      "source": "github",
+      "repo": "anthropics/claude-plugins-community"
+    },
+    "installLocation": "/home/user/.claude/plugins/marketplaces/claude-community",
+    "lastUpdated": "2026-09-16T12:58:01.852Z"
+  },
+  "ui-ux-pro-max-skill": {
+    "source": {
+      "source": "github",
+      "repo": "nextlevelbuilder/ui-ux-pro-max-skill"
+    },
+    "installLocation": "/home/user/.claude/plugins/marketplaces/ui-ux-pro-max-skill",
+    "lastUpdated": "2026-09-01T05:24:12.827Z"
+  },
+  "ultimate-code-review": {
+    "source": {
+      "source": "github",
+      "repo": "bradwindy/ultimate-code-review"
+    },
+    "installLocation": "/home/user/.claude/plugins/marketplaces/ultimate-code-review",
+    "lastUpdated": "2026-09-01T05:28:26.205Z"
+  },
+  "thedotmack": {
+    "source": {
+      "source": "github",
+      "repo": "thedotmack/claude-mem"
+    },
+    "installLocation": "/home/user/.claude/plugins/marketplaces/thedotmack",
+    "lastUpdated": "2026-09-01T05:30:56.596Z"
+  },
+  "gsd-plugin": {
+    "source": {
+      "source": "github",
+      "repo": "jnuyens/gsd-plugin"
+    },
+    "installLocation": "/home/user/.claude/plugins/marketplaces/gsd-plugin",
+    "lastUpdated": "2026-09-16T12:59:02.166Z"
+  }
+}

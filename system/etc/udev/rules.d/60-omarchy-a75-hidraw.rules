@@ -1,0 +1,5 @@
+# Grant the user on the active seat access to the VGN A75's HID interfaces so
+# the user.a75 bar plugin can configure the keyboard over hidraw. TAG+="uaccess"
+# makes systemd-logind attach an ACL for that user instead of opening the node
+# to everyone.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3151", TAG+="uaccess"

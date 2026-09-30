@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""Report mouse battery, DPI and polling rate as JSON for the user.mouse bar plugin.
+
+Razer mice do not expose battery through UPower, so the numbers come straight
+off the device: a 90-byte Razer report written and read back as HID feature
+report 0 over hidraw. That needs no kernel module and no daemon -- only read
+access to the control hidraw node, which 60-omarchy-mouse-hidraw.rules grants
+to the active seat user.
+
+Any other mouse falls back to whatever UPower already knows, which is battery
+and nothing else.
+"""
+
+import fcntl
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+RAZER_VENDOR = "1532"
+
+# Devices whose battery/DPI we know how to name. Anything else still works --
+# the name just falls back to whatever the kernel reports in HID_NAME.
+KNOWN = {
+    "00C0": "Razer Viper V3 Pro (wired)",
+    "00C1": "Razer Viper V3 Pro",
+}
+
+
+# --------------------------------------------------------------- hidraw ioctl
+
+def _ioc(direction, letter, nr, size):
+    return (direction << 30) | (size << 16) | (ord(letter) << 8) | nr
+
+
+_IOC_RW = 3
+REPORT_LEN = 91  # 1 report-id byte + the 90-byte Razer report
+
+
+def _set_feature(length):
+    return _ioc(_IOC_RW, "H", 0x06, length)
+
+
+def _get_feature(length):
+    return _ioc(_IOC_RW, "H", 0x07, length)
+
+
+def build_report(transaction_id, command_class, command_id, data_size, args=b""):
+    """Lay out the 90-byte Razer report. CRC is the XOR of bytes 2..87."""
+    report = bytearray(90)
+    report[1] = transaction_id
+    report[5] = data_size
+    report[6] = command_class
+    report[7] = command_id
+    report[8:8 + len(args)] = args
+    crc = 0
+    for i in range(2, 88):
+        crc ^= report[i]
+    report[88] = crc
+    return bytes(report)
+
+
+def talk(path, command_class, command_id, data_size, args=b"", transaction_id=0x1F,
+         settle=0.05):
+    """Send one Razer command and read the reply. Returns the 90-byte response."""
+    out = bytearray(REPORT_LEN)
+    out[1:] = build_report(transaction_id, command_class, command_id, data_size, args)
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.ioctl(fd, _set_feature(REPORT_LEN), bytes(out))
+        # The device needs a moment before the reply is readable; without this
+        # the read comes back as status "busy".
+        time.sleep(settle)
+        back = bytearray(REPORT_LEN)
+        fcntl.ioctl(fd, _get_feature(REPORT_LEN), back)
+        return bytes(back[1:])
+    finally:
+        os.close(fd)
+
+
+def ok(response):
+    return bool(response) and response[0] == 0x02
+
+
+def args_of(response):
+    return response[8:88]
+
+
+# ------------------------------------------------------------------ discovery
+
+def hid_name(sysfs_dir):
+    try:
+        with open(os.path.join(sysfs_dir, "uevent")) as handle:
+            for line in handle:
+                if line.startswith("HID_NAME="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def razer_candidates():
+    """Every hidraw node belonging to a Razer HID device, newest interface last."""
+    found = []
+    for sysfs_dir in sorted(glob.glob("/sys/bus/hid/devices/*:%s:*" % RAZER_VENDOR)):
+        product = ""
+        match = re.search(r":%s:([0-9A-Fa-f]{4})" % RAZER_VENDOR, sysfs_dir)
+        if match:
+            product = match.group(1).upper()
+        for node in sorted(glob.glob(os.path.join(sysfs_dir, "hidraw", "hidraw*"))):
+            found.append(("/dev/" + os.path.basename(node), product, hid_name(sysfs_dir)))
+    return found
+
+
+def query(path, command_class, command_id, data_size, args=b"", attempts=3):
+    """Send one command, retrying briefly before giving up.
+
+    Two things make a single attempt unreliable. A mouse that has gone idle
+    answers the first report with status 0x04 (timeout) and only wakes on a
+    retry; and reading the reply too soon after writing gets the same 0x04
+    because the device has not written it yet. So each retry also waits a
+    little longer.
+    """
+    settle = 0.06
+    for _ in range(attempts):
+        try:
+            response = talk(path, command_class, command_id, data_size, args,
+                            settle=settle)
+        except OSError:
+            # Wrong interface for vendor commands (EPIPE); no retry will help.
+            return None
+        if ok(response):
+            return response
+        settle += 0.04
+    return None
+
+
+def find_control_node():
+    """Only one of a Razer device's interfaces answers vendor commands.
+
+    The others reject the feature report outright (EPIPE), so probing with a
+    cheap firmware read is enough to pick the right one.
+    """
+    for path, product, name in razer_candidates():
+        if not os.access(path, os.R_OK | os.W_OK):
+            continue
+        if query(path, 0x00, 0x81, 0x02) is not None:
+            return path, product, name
+    return None, None, None
+
+
+# -------------------------------------------------------------------- queries
+
+def read_battery(path):
+    response = query(path, 0x07, 0x80, 0x02)
+    if response is None:
+        return None
+    return round(args_of(response)[1] / 255.0 * 100)
+
+
+def read_charging(path):
+    response = query(path, 0x07, 0x84, 0x02)
+    if response is None:
+        return None
+    return args_of(response)[1] == 0x01
+
+
+def read_dpi(path):
+    response = query(path, 0x04, 0x85, 0x07, bytes([0x00]))
+    if response is None:
+        return None, None
+    data = args_of(response)
+    return (data[1] << 8) | data[2], (data[3] << 8) | data[4]
+
+
+def read_dpi_stages(path):
+    """Returns (active_index, [dpi, ...]) for the on-device DPI stage list."""
+    response = query(path, 0x04, 0x86, 0x26, bytes([0x00]))
+    if response is None:
+        return None, []
+    data = args_of(response)
+    active = data[1]
+    count = data[2]
+    if not 0 < count <= 10:
+        return None, []
+    stages = []
+    for i in range(count):
+        base = 3 + i * 7
+        if base + 4 >= len(data):
+            break
+        stages.append((data[base + 1] << 8) | data[base + 2])
+    return active, stages
+
+
+def read_polling_rate(path):
+    """Newer Razer mice report a divider of 8000Hz rather than a rate code."""
+    response = query(path, 0x00, 0xC0, 0x02, bytes([0x00]))
+    if response is not None:
+        divider = args_of(response)[1]
+        if divider:
+            return round(8000 / divider)
+    # Older devices answer the legacy command with a rate code instead.
+    response = query(path, 0x00, 0x85, 0x01, attempts=1)
+    if response is not None:
+        return {0x01: 1000, 0x02: 500, 0x08: 125}.get(args_of(response)[0])
+    return None
+
+
+def read_firmware(path):
+    response = query(path, 0x00, 0x81, 0x02)
+    if response is None:
+        return None
+    data = args_of(response)
+    return "%d.%d" % (data[0], data[1])
+
+
+# ------------------------------------------------------------ upower fallback
+
+def upower_mouse():
+    """Battery for any non-Razer mouse that UPower already tracks."""
+    try:
+        listing = subprocess.run(["upower", "-e"], capture_output=True, text=True,
+                                 timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for path in listing.split():
+        if "mouse" not in path.lower():
+            continue
+        try:
+            info = subprocess.run(["upower", "-i", path], capture_output=True,
+                                  text=True, timeout=3).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        percent = re.search(r"percentage:\s*([\d.]+)%", info)
+        model = re.search(r"model:\s*(.+)", info)
+        state = re.search(r"state:\s*(\w+)", info)
+        if percent:
+            return {
+                "present": True,
+                "online": True,
+                "source": "upower",
+                "name": model.group(1).strip() if model else "Mouse",
+                "vendor": (re.search(r"vendor:\s*(.+)", info).group(1).strip() if re.search(r"vendor:\s*(.+)", info) else ""),
+                "battery": round(float(percent.group(1))),
+                "charging": bool(state and state.group(1) == "charging"),
+                "dpi": None, "dpiX": None, "dpiY": None,
+                "dpiStage": None, "dpiStages": [],
+                "pollingRate": None, "firmware": None,
+            }
+    return None
+
+
+# ----------------------------------------------------------------- accel state
+
+def accel_enabled():
+    """True when Hyprland is applying a pointer acceleration curve.
+
+    An unset accel_profile means libinput's default, which is adaptive -- so
+    only an explicit "flat" counts as acceleration off.
+    """
+    try:
+        out = subprocess.run(["hyprctl", "getoption", "input:accel_profile"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"str:\s*(.*)", out)
+    if not match:
+        return None
+    value = match.group(1).strip()
+    if value in ("[[EMPTY]]", ""):
+        return True
+    return "flat" not in value
+
+
+# ------------------------------------------------------------------------ main
+
+def razer_status():
+    path, product, name = find_control_node()
+    if not path:
+        return None
+
+    battery = read_battery(path)
+    # A dongle that is still plugged in answers every command even with the
+    # mouse switched off, and reports 0%. Treat that as "asleep", not as a
+    # genuinely flat battery, so the widget can say so instead of crying wolf.
+    online = battery is not None and battery > 0
+
+    status = {
+        "present": True,
+        "online": online,
+        "source": "razer",
+        "name": KNOWN.get(product or "", "") or name or "Razer mouse",
+        "vendor": "Razer",
+        "battery": battery if online else None,
+        "charging": read_charging(path) if online else False,
+        "dpi": None, "dpiX": None, "dpiY": None,
+        "dpiStage": None, "dpiStages": [],
+        "pollingRate": None,
+        "firmware": read_firmware(path),
+    }
+
+    if online:
+        dpi_x, dpi_y = read_dpi(path)
+        status["dpiX"], status["dpiY"] = dpi_x, dpi_y
+        status["dpi"] = dpi_x
+        active, stages = read_dpi_stages(path)
+        status["dpiStage"] = active
+        status["dpiStages"] = stages
+        status["pollingRate"] = read_polling_rate(path)
+
+    return status
+
+
+# ------------------------------------------------------- serialise + cache
+#
+# The bar builds one widget instance per monitor, so every poll fires this
+# script once per screen at the same instant. The Razer control interface
+# does not tolerate that: concurrent feature reports collide and all but one
+# caller gets a failed status back, which showed up as the widget vanishing
+# on a multi-monitor setup.
+#
+# So exactly one process talks to the device and parks the answer in a
+# short-lived cache; the rest of that burst just read the file.
+
+CACHE_TTL = 2.5
+LOCK_TIMEOUT = 2.0
+STALE_TTL = 30.0
+
+
+def cache_path():
+    base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    return os.path.join(base, "omarchy-mouse-status.json")
+
+
+def read_cache(max_age):
+    try:
+        stat = os.stat(cache_path())
+        if time.time() - stat.st_mtime > max_age:
+            return None
+        with open(cache_path()) as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def write_cache(payload):
+    path = cache_path()
+    temp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with open(temp, "w") as handle:
+            json.dump(payload, handle)
+        os.replace(temp, path)
+    except OSError:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+
+
+class DeviceLock:
+    """Exclusive, non-blocking-with-deadline lock around device access."""
+
+    def __init__(self, timeout):
+        self.timeout = timeout
+        self.fd = None
+        self.acquired = False
+
+    def __enter__(self):
+        try:
+            self.fd = os.open(cache_path() + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            return False
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.acquired = True
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.05)
+        return self.acquired
+
+    def __exit__(self, *_):
+        if self.fd is None:
+            return False
+        if self.acquired:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(self.fd)
+        return False
+
+
+def collect():
+    try:
+        status = razer_status()
+    except OSError as error:
+        status = {"present": False, "online": False, "source": "razer",
+                  "error": str(error)}
+
+    if not status or not status.get("present"):
+        status = upower_mouse() or {
+            "present": False, "online": False, "source": "none",
+            "name": "", "battery": None, "charging": False,
+            "dpi": None, "dpiX": None, "dpiY": None,
+            "dpiStage": None, "dpiStages": [],
+            "pollingRate": None, "firmware": None,
+        }
+    return status
+
+
+def main():
+    status = read_cache(CACHE_TTL)
+
+    if status is None:
+        with DeviceLock(LOCK_TIMEOUT) as acquired:
+            # Whoever held the lock has very likely just refreshed the cache.
+            status = read_cache(CACHE_TTL)
+            if status is None:
+                if acquired:
+                    status = collect()
+                    write_cache(status)
+                else:
+                    # Waited out the lock: a slightly stale reading beats
+                    # reporting the mouse as gone.
+                    status = read_cache(STALE_TTL) or collect()
+
+    # Never cached: it costs one cheap hyprctl call and has to stay in step
+    # with a toggle the user just flipped.
+    status["accel"] = accel_enabled()
+
+    json.dump(status, sys.stdout)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

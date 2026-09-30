@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""GPU driver update check for the user.gpu Omarchy plugin.
+
+  check [--no-upstream]   JSON report: GPUs, driver in use, installed driver
+                          packages, pending repo/AUR updates for them, whether
+                          the running driver/kernel differs from what is
+                          installed (reboot needed), and NVIDIA's latest
+                          upstream release.
+
+Uses `checkupdates` (syncs a private copy of the pacman databases, no root)
+and, when present, the AUR helper's `-Qua`. Only reports; updating is left to
+`omarchy update` — partial upgrades are unsupported on Arch.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime, timezone
+
+GPU_PKG = re.compile(
+    r"^(nvidia.*|lib32-nvidia.*|mesa.*|lib32-mesa.*|"
+    r"vulkan-(radeon|intel|nouveau|swrast|virtio|mesa-layers|icd-loader|headers)|lib32-vulkan-.*|"
+    r"amdvlk|lib32-amdvlk|xf86-video-.*|linux-firmware(-nvidia|-amdgpu|-radeon|-intel)?|"
+    r"libva-.*driver.*|intel-media-driver|libva-nvidia-driver|egl-wayland.*|egl-gbm|egl-x11|"
+    r"opencl-.*|cuda.*|rocm-.*|libxnvctrl|nvidia-settings|"
+    r"linux(-lts|-zen|-hardened|-cachyos)?(-headers)?|dkms)$"
+)
+# Packages whose update means the kernel module / driver must be reloaded.
+REBOOT_PKG = re.compile(r"^(nvidia.*|lib32-nvidia-utils|linux(-lts|-zen|-hardened|-cachyos)?(-headers)?|mesa|lib32-mesa|linux-firmware.*)$")
+NVIDIA_LATEST_URL = "https://download.nvidia.com/XFree86/Linux-x86_64/latest.txt"
+
+
+def run(argv, timeout=60):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, "", str(e)
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def gpus():
+    out = []
+    code, text, _ = run(["lspci", "-nn"], timeout=10)
+    if code == 0:
+        for line in text.splitlines():
+            if re.search(r"\b(VGA compatible controller|3D controller|Display controller)\b", line):
+                m = re.match(r"^(\S+)\s+[^:]+:\s+(.*)$", line)
+                if not m:
+                    continue
+                slot, desc = m.group(1), m.group(2)
+                desc = re.sub(r"\s*\[[0-9a-f]{4}:[0-9a-f]{4}\].*$", "", desc)
+                desc = re.sub(r"\s*\(rev [0-9a-f]+\)$", "", desc)
+                name = desc
+                mm = re.search(r"\[([^\]]+)\]", desc)
+                if mm:
+                    name = mm.group(1)
+                vendor = "nvidia" if "NVIDIA" in desc else "amd" if ("AMD" in desc or "ATI" in desc or "Radeon" in desc) else "intel" if "Intel" in desc else "other"
+                out.append({"slot": slot, "name": name, "full": desc, "vendor": vendor, "driver": ""})
+    # Kernel driver bound to each GPU.
+    for card in sorted(os.listdir("/sys/class/drm")) if os.path.isdir("/sys/class/drm") else []:
+        if not re.match(r"^card\d+$", card):
+            continue
+        dev = f"/sys/class/drm/{card}/device"
+        try:
+            drv = os.path.basename(os.readlink(f"{dev}/driver"))
+        except OSError:
+            drv = ""
+        try:
+            slot = os.path.basename(os.path.realpath(dev))
+        except OSError:
+            slot = ""
+        for g in out:
+            if slot.endswith(g["slot"]) and drv:
+                g["driver"] = drv
+    return out
+
+
+def installed_packages():
+    code, text, _ = run(["pacman", "-Q"], timeout=20)
+    pkgs = {}
+    if code == 0:
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and GPU_PKG.match(parts[0]):
+                pkgs[parts[0]] = parts[1]
+    return pkgs
+
+
+def repo_updates():
+    if not shutil.which("checkupdates"):
+        return None, "checkupdates (pacman-contrib) is not installed"
+    code, text, err = run(["checkupdates", "--nocolor"], timeout=180)
+    # exit 2 = no updates, 0 = updates, 1 = error
+    if code == 1:
+        return None, (err.strip() or "checkupdates failed")
+    ups = []
+    for line in text.splitlines():
+        m = re.match(r"^(\S+)\s+(\S+)\s+->\s+(\S+)$", line.strip())
+        if m:
+            ups.append({"name": m.group(1), "old": m.group(2), "new": m.group(3), "source": "repo"})
+    return ups, ""
+
+
+def aur_updates():
+    helper = next((h for h in ("yay", "paru") if shutil.which(h)), None)
+    if not helper:
+        return [], ""
+    code, text, err = run([helper, "-Qua", "--color=never"], timeout=180)
+    ups = []
+    for line in text.splitlines():
+        line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+        m = re.match(r"^(?:\S+/)?(\S+)\s+(\S+)\s+->\s+(\S+)", line)
+        if m:
+            ups.append({"name": m.group(1), "old": m.group(2), "new": m.group(3), "source": "aur"})
+    return ups, ""
+
+
+def nvidia_upstream():
+    try:
+        with urllib.request.urlopen(NVIDIA_LATEST_URL, timeout=8) as r:
+            text = r.read().decode(errors="replace").strip()
+        m = re.match(r"^(\S+)", text)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+def version_core(v):
+    """'610.57.04-1' -> '610.57.04'; '1:26.2.1-1' -> '26.2.1'."""
+    v = re.sub(r"^\d+:", "", v or "")
+    return re.sub(r"-\d+$", "", v)
+
+
+def check(with_upstream=True):
+    report = {
+        "checkedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "gpus": gpus(),
+        "installed": {},
+        "updates": [],
+        "rebootNeeded": False,
+        "rebootReasons": [],
+        "warnings": [],
+        "running": {},
+        "upstream": {},
+    }
+    pkgs = installed_packages()
+    report["installed"] = pkgs
+
+    # Running kernel vs installed kernel package.
+    uname = read("/proc/sys/kernel/osrelease")
+    report["running"]["kernel"] = uname
+    kpkg = next((k for k in ("linux", "linux-lts", "linux-zen", "linux-hardened", "linux-cachyos") if k in pkgs), "")
+    if kpkg:
+        report["running"]["kernelPackage"] = kpkg + " " + pkgs[kpkg]
+        # pacman: 7.1.9.arch1-2 ; uname: 7.1.9-arch1-2
+        want = pkgs[kpkg].replace(".arch", "-arch").replace(".lts", "-lts").replace(".zen", "-zen").replace(".hardened", "-hardened")
+        if uname and want and uname != want and not uname.startswith(want):
+            report["rebootNeeded"] = True
+            report["rebootReasons"].append(f"kernel {uname} is running, {want} is installed")
+
+    # Running NVIDIA module vs nvidia-utils package.
+    nv_running = read("/sys/module/nvidia/version")
+    if nv_running:
+        report["running"]["nvidia"] = nv_running
+        nv_pkg = pkgs.get("nvidia-utils") or pkgs.get("nvidia-open-dkms") or pkgs.get("nvidia-dkms") or pkgs.get("nvidia") or pkgs.get("nvidia-open") or ""
+        if nv_pkg and version_core(nv_pkg) != nv_running:
+            report["rebootNeeded"] = True
+            report["rebootReasons"].append(f"NVIDIA driver {nv_running} is loaded, {version_core(nv_pkg)} is installed")
+        if with_upstream:
+            latest = nvidia_upstream()
+            if latest:
+                report["upstream"]["nvidia"] = {
+                    "latest": latest,
+                    "installed": version_core(nv_pkg) if nv_pkg else nv_running,
+                    "newer": bool(latest and nv_pkg and _vtuple(latest) > _vtuple(version_core(nv_pkg))),
+                }
+
+    # Mesa version as reported by the package (running version isn't exposed).
+    if "mesa" in pkgs:
+        report["running"]["mesa"] = version_core(pkgs["mesa"])
+
+    ups, err = repo_updates()
+    if ups is None:
+        report["warnings"].append(err)
+        ups = []
+    aur, aerr = aur_updates()
+    if aerr:
+        report["warnings"].append(aerr)
+    allups = ups + aur
+    report["totalUpdates"] = len(allups)
+    report["updates"] = [u for u in allups if GPU_PKG.match(u["name"])]
+    for u in report["updates"]:
+        u["reboot"] = bool(REBOOT_PKG.match(u["name"]))
+    # Sort: driver core first.
+    prio = ["nvidia-utils", "nvidia-open-dkms", "nvidia-dkms", "nvidia", "nvidia-open", "mesa", "lib32-mesa", "linux", "linux-headers"]
+    report["updates"].sort(key=lambda u: (prio.index(u["name"]) if u["name"] in prio else 99, u["name"]))
+    return report
+
+
+def _vtuple(v):
+    return tuple(int(x) if x.isdigit() else 0 for x in re.split(r"[.\-]", v or "0"))
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return
+    if args[0] == "check":
+        print(json.dumps(check(with_upstream="--no-upstream" not in args)))
+    else:
+        print(json.dumps({"ok": False, "error": "usage: check [--no-upstream]"}))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

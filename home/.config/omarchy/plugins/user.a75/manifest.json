@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "user.a75",
+  "name": "VGN A75",
+  "version": "0.1.0",
+  "author": "user",
+  "description": "Trigger presets, actuation, rapid trigger and dead zones for the VGN A75 hall-effect keyboard, plus a hand-off to the vendor hub for firmware updates",
+  "kinds": ["service", "bar-widget"],
+  "keepLoaded": true,
+  "entryPoints": { "service": "Engine.qml", "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "VGN A75",
+    "description": "Keyboard glyph with the active trigger preset. Left = panel, middle = next profile, right = refresh.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "refreshIntervalSec": 60, "showPresetInBar": false },
+    "schema": [
+      { "key": "refreshIntervalSec", "type": "integer", "label": "Refresh interval (seconds)", "min": 15, "max": 900, "step": 15, "defaultValue": 60 },
+      { "key": "showPresetInBar", "type": "boolean", "label": "Show the preset name next to the icon", "defaultValue": false }
+    ]
+  }
+}

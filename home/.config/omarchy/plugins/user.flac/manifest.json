@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "id": "user.flac",
+  "name": "FLAC Player",
+  "version": "1.0.0",
+  "author": "user",
+  "description": "Bit-perfect, gapless FLAC player driven by mpv \u2014 direct ALSA exclusive output or shared PipeWire output",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Engine.qml",
+    "barWidget": "Player.qml"
+  },
+  "barWidget": {
+    "displayName": "FLAC Player",
+    "description": "Now playing, transport, exclusive-mode switch and album library. Left = panel, middle = play/pause, right = next, scroll = previous/next.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "libraryDir": "/run/media/user/Downloads & Media/Music",
+      "exclusive": false,
+      "alsaDevice": "alsa/hw:CARD=II,DEV=0",
+      "pwDeviceName": "alsa_card.usb-Topping_E50_II-00",
+      "pwSinkName": "",
+      "showTitleInBar": false
+    },
+    "schema": [
+      {
+        "key": "libraryDir",
+        "type": "string",
+        "label": "Library directory",
+        "defaultValue": "/run/media/user/Downloads & Media/Music",
+        "description": "Scanned recursively for .flac files."
+      },
+      {
+        "key": "exclusive",
+        "type": "boolean",
+        "label": "Exclusive mode (bit-perfect)",
+        "defaultValue": false,
+        "description": "Open the DAC directly through ALSA, bypassing PipeWire. PipeWire releases the device while playing; other apps fall back to another output."
+      },
+      {
+        "key": "alsaDevice",
+        "type": "string",
+        "label": "ALSA device (exclusive mode)",
+        "defaultValue": "alsa/hw:CARD=II,DEV=0",
+        "description": "mpv --audio-device value. Must be a hw: device for bit-perfect output."
+      },
+      {
+        "key": "pwDeviceName",
+        "type": "string",
+        "label": "PipeWire device name",
+        "defaultValue": "alsa_card.usb-Topping_E50_II-00",
+        "description": "device.name of the card PipeWire must release in exclusive mode (see pw-dump)."
+      },
+      {
+        "key": "pwSinkName",
+        "type": "string",
+        "label": "PipeWire sink (shared mode)",
+        "defaultValue": "",
+        "description": "node.name of the sink used when exclusive mode is off. Empty = default sink."
+      },
+      {
+        "key": "showTitleInBar",
+        "type": "boolean",
+        "label": "Show track title in the bar",
+        "defaultValue": false
+      }
+    ]
+  }
+}

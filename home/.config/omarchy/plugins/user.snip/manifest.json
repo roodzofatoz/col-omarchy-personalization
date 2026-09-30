@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "user.snip",
+  "name": "Snip",
+  "version": "1.0.0",
+  "author": "user",
+  "description": "Drag a region of the screen straight onto the clipboard, like the Windows snipping tool",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Snip.qml"
+  },
+  "barWidget": {
+    "displayName": "Snip",
+    "description": "Click, drag a region, and the image is on your clipboard. Right click also saves it to Pictures and offers the editor.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "alsoSave": false
+    },
+    "schema": [
+      {
+        "key": "alsoSave",
+        "type": "boolean",
+        "label": "Left click also saves a file",
+        "defaultValue": false,
+        "description": "Off: the snip only goes to the clipboard. On: it is also written to your screenshots folder."
+      }
+    ]
+  }
+}

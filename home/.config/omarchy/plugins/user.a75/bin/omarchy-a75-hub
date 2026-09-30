@@ -1,0 +1,133 @@
+#!/bin/bash
+# Firmware updates for the VGN A75 use the vendor's own flow: their web hub talks
+# gRPC to a local helper on 127.0.0.1:3814. VGN ships that helper for Windows and
+# Mac only; the MonsGeek/Akko Linux driver implements the same gRPC contract, so
+# this script builds it once (at a pinned commit), runs it as a user unit, and
+# opens the hub in its own browser window.
+#
+# While the helper runs, a hold file keeps bin/omarchy-a75 (and therefore the bar
+# plugin) off the wire: a feature report injected mid-flash could stall the
+# keyboard. The hold is released by `stop`, which also runs automatically when
+# the hub window closes.
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"      # absolute: the watcher unit runs from $HOME
+SHARE="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-a75"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-a75"
+SRC="$SHARE/monsgeek-akko-linux"
+REPO="https://github.com/echtzeit-solutions/monsgeek-akko-linux.git"
+# Pinned so the binary that talks to the keyboard is reproducible; bump deliberately.
+PIN="79c45f11dcc0fdd24d6075a0f30f5dabbc748c9b"
+UNIT="omarchy-a75-hub"
+BROWSER_UNIT="omarchy-a75-hub-browser"
+WATCH_UNIT="omarchy-a75-hub-watch"
+HOLD="$STATE/hub.hold"
+HUB_URL="https://vgn.rongyuan.tech/"
+# The hub's React app only mounts when its platform detector sees Windows or
+# macOS in the user agent (it returns undefined for Linux and never renders),
+# so the hub gets its own Chromium profile with a Windows user agent.
+HUB_PROFILE="$SHARE/hub-profile"
+HUB_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+
+notify() { command -v notify-send >/dev/null && notify-send -a "VGN A75" "$1" "${2:-}" || true; }
+
+find_binary() {
+  for candidate in "$SRC/iot_driver_linux/target/release/iot_driver" "$SRC/target/release/iot_driver"; do
+    if [[ -x $candidate ]]; then echo "$candidate"; return 0; fi
+  done
+  return 1
+}
+
+built_commit() { git -C "$SRC" rev-parse HEAD 2>/dev/null || echo ""; }
+
+build() {
+  mkdir -p "$SHARE"
+  notify "Building firmware helper" "This takes a few minutes the first time"
+  if [[ ! -d $SRC/.git ]]; then
+    git clone "$REPO" "$SRC"
+  fi
+  if [[ "$(built_commit)" != "$PIN" ]]; then
+    git -C "$SRC" fetch --quiet origin "$PIN"
+    git -C "$SRC" checkout --quiet "$PIN"
+  fi
+  cargo build --release --manifest-path "$SRC/iot_driver_linux/Cargo.toml"
+  find_binary >/dev/null
+  notify "Firmware helper ready"
+}
+
+running() { systemctl --user is-active --quiet "$UNIT"; }
+unit_active() { systemctl --user is-active --quiet "$1"; }
+
+start() {
+  local bin
+  if ! bin="$(find_binary)" || [[ "$(built_commit)" != "$PIN" ]]; then
+    build
+    bin="$(find_binary)"
+  fi
+  mkdir -p "$STATE"
+  echo "$$ $(date -Is)" > "$HOLD"
+  if running; then return 0; fi
+  systemd-run --user --unit "$UNIT" --collect --quiet "$bin" serve
+  # give it a moment to bind
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    running && return 0
+    sleep 0.3
+  done
+  rm -f "$HOLD"
+  echo "helper did not stay up; see: journalctl --user -u $UNIT" >&2
+  exit 1
+}
+
+stop() {
+  # Release the keyboard first, then the helper and browser; the watcher goes
+  # last because `stop` may be running inside it.
+  rm -f "$HOLD"
+  for u in "$UNIT" "$BROWSER_UNIT" "$WATCH_UNIT"; do
+    unit_active "$u" && systemctl --user stop "$u" || true
+  done
+}
+
+open_hub() {
+  local browser=""
+  for candidate in chromium google-chrome-stable google-chrome brave; do
+    if command -v "$candidate" >/dev/null; then browser="$candidate"; break; fi
+  done
+  if [[ -z $browser ]]; then
+    echo "no Chromium-based browser found (the hub needs one)" >&2
+    stop
+    exit 1
+  fi
+  mkdir -p "$HUB_PROFILE"
+  if unit_active "$BROWSER_UNIT"; then return 0; fi
+  systemd-run --user --unit "$BROWSER_UNIT" --collect --quiet \
+    "$browser" --user-data-dir="$HUB_PROFILE" --no-first-run --no-default-browser-check \
+    --user-agent="$HUB_UA" --app="$HUB_URL"
+  # When the hub window goes away, release the keyboard again.
+  unit_active "$WATCH_UNIT" || systemd-run --user --unit "$WATCH_UNIT" --collect --quiet \
+    /bin/bash -c "while systemctl --user is-active --quiet '$BROWSER_UNIT'; do sleep 2; done; '$SELF' stop"
+}
+
+status() {
+  local bin built=false run=false hold=false
+  if bin="$(find_binary)"; then built=true; else bin=""; fi
+  running && run=true
+  [[ -f $HOLD ]] && hold=true
+  python3 -c 'import json,sys; print(json.dumps({"built": sys.argv[1]=="true", "running": sys.argv[2]=="true", "held": sys.argv[3]=="true", "binary": sys.argv[4], "commit": sys.argv[5], "pin": sys.argv[6]}))' \
+    "$built" "$run" "$hold" "$bin" "$(built_commit)" "$PIN"
+}
+
+check() {
+  local bin
+  bin="$(find_binary)" || { echo "helper not built" >&2; exit 1; }
+  "$bin" info
+}
+
+case "${1:-status}" in
+  build) build ;;
+  start) start ;;
+  stop) stop ;;
+  status) status ;;
+  check) check ;;
+  open) start; open_hub ;;
+  *) echo "Usage: omarchy-a75-hub [build|start|stop|status|check|open]" >&2; exit 1 ;;
+esac

@@ -1,0 +1,75 @@
+#!/bin/bash
+# Enable/disable pointer acceleration for the user.mouse bar plugin.
+#
+# Two things have to happen for a toggle to stick:
+#   1. an eval into the running Hyprland -- takes effect immediately.
+#   2. a toggle file -- Omarchy sources every .lua under the hypr toggles
+#      state dir on config load, so the choice survives a reload and a reboot.
+#
+# Acceleration off is the *presence* of the file; acceleration on is its
+# absence, which leaves the profile at Omarchy's default rather than pinning
+# a value it never set.
+#
+# Note this Hyprland runs the Lua config parser, which refuses `hyprctl
+# keyword` outright ("keyword can't work with non-legacy parsers"). The
+# runtime change has to go through `hyprctl eval` and hl.config instead --
+# and because hyprctl exits 0 even when it rejects the request, the reply
+# text is what has to be checked.
+
+set -euo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/toggles/hypr"
+FLAG="$STATE_DIR/mouse-no-accel.lua"
+
+apply() {
+  local profile="$1" reply
+  reply="$(hyprctl eval "hl.config({ input = { accel_profile = \"$profile\" } })" 2>&1)"
+  if [[ $reply != ok* ]]; then
+    echo "hyprctl eval failed: $reply" >&2
+    return 1
+  fi
+}
+
+current() {
+  # An unset profile is Omarchy's default, which accelerates.
+  local value
+  value="$(hyprctl getoption input:accel_profile 2>/dev/null | sed -n 's/^str:[[:space:]]*//p')"
+  if [[ -z $value || $value == "[[EMPTY]]" || $value != *flat* ]]; then
+    echo on
+  else
+    echo off
+  fi
+}
+
+turn_off() {
+  mkdir -p "$STATE_DIR"
+  cat >"$FLAG" <<'LUA'
+-- Pointer acceleration off (flat profile).
+-- Managed by the user.mouse bar plugin; delete this file to restore the
+-- default, or use the mouse widget's Acceleration switch.
+hl.config({
+  input = {
+    accel_profile = "flat",
+  },
+})
+LUA
+  apply flat
+}
+
+turn_on() {
+  rm -f "$FLAG"
+  apply adaptive
+}
+
+case "${1:-get}" in
+  get) current ;;
+  on) turn_on ;;
+  off) turn_off ;;
+  toggle)
+    if [[ $(current) == on ]]; then turn_off; else turn_on; fi
+    ;;
+  *)
+    echo "Usage: omarchy-mouse-accel [get|on|off|toggle]" >&2
+    exit 1
+    ;;
+esac

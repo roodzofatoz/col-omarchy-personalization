@@ -1,0 +1,84 @@
+{
+  "version": 2,
+  "plugins": {
+    "pilotfish@pilotfish": [
+      {
+        "scope": "user",
+        "installPath": "/home/user/.claude/plugins/cache/pilotfish/pilotfish/1.4.1",
+        "version": "1.4.1",
+        "installedAt": "2026-08-27T13:03:11.735Z",
+        "lastUpdated": "2026-08-27T13:03:11.735Z",
+        "gitCommitSha": "e556afb0e6cf6a9b482b207273396bf2faf56344"
+      }
+    ],
+    "superpowers@claude-plugins-official": [
+      {
+        "scope": "user",
+        "installPath": "/home/user/.claude/plugins/cache/claude-plugins-official/superpowers/6.4.1",
+        "version": "6.4.1",
+        "installedAt": "2026-09-01T05:23:36.705Z",
+        "lastUpdated": "2026-09-22T18:43:31.426Z",
+        "gitCommitSha": "b36e0829c6d0140e93cfef2ca599b1b07d4a7797"
+      }
+    ],
+    "context-mode@claude-community": [
+      {
+        "scope": "user",
+        "installPath": "/home/user/.claude/plugins/cache/claude-community/context-mode/1.0.169",
+        "version": "1.0.169",
+        "installedAt": "2026-09-01T05:23:52.466Z",
+        "lastUpdated": "2026-09-30T13:26:31.636Z",
+        "gitCommitSha": "37dc25b920205a5ee1d20a3577b22aabe6dd48c5"
+      }
+    ],
+    "ui-ux-pro-max@ui-ux-pro-max-skill": [
+      {
+        "scope": "user",
+        "installPath": "/home/user/.claude/plugins/cache/ui-ux-pro-max-skill/ui-ux-pro-max/2.13.0",
+        "version": "2.13.0",
+        "installedAt": "2026-09-01T05:24:14.072Z",
+        "lastUpdated": "2026-09-01T05:24:14.072Z",
+        "gitCommitSha": "f23267105ad1f4ccd94af45d382584ad45b586f7"
+      }
+    ],
+    "frontend-design@claude-plugins-official": [
+      {
+        "scope": "user",
+        "installPath": "/home/user/.claude/plugins/cache/claude-plugins-official/frontend-design/2a8ad9f74633",
+        "version": "2a8ad9f74633",
+        "installedAt": "2026-09-01T05:28:23.262Z",
+        "lastUpdated": "2026-09-30T05:26:46.598Z"
+      }
+    ],
+    "ultimate-code-review@ultimate-code-review": [
+      {
+        "scope": "user",
+        "installPath": "/home/user/.claude/plugins/cache/ultimate-code-review/ultimate-code-review/1.6.0",
+        "version": "1.6.0",
+        "installedAt": "2026-09-01T05:28:31.750Z",
+        "lastUpdated": "2026-09-01T05:28:31.750Z",
+        "gitCommitSha": "70989ed7ec36a98ecde0e6c5a728e93de6c868df"
+      }
+    ],
+    "claude-mem@thedotmack": [
+      {
+        "scope": "user",
+        "installPath": "/home/user/.claude/plugins/cache/thedotmack/claude-mem/13.21.2",
+        "version": "13.21.2",
+        "installedAt": "2026-09-01T05:30:57.826Z",
+        "lastUpdated": "2026-09-01T05:30:57.826Z",
+        "gitCommitSha": "8f085b4f8861122201a5524be71d696a49a812a3"
+      }
+    ],
+    "gsd@gsd-plugin": [
+      {
+        "scope": "user",
+        "installPath": "/home/user/.claude/plugins/cache/gsd-plugin/gsd/4.7.0",
+        "version": "4.7.0",
+        "installedAt": "2026-09-16T12:59:03.460Z",
+        "lastUpdated": "2026-09-16T12:59:03.460Z",
+        "gitCommitSha": "842f1e183385521f474b2caafe9ea42e9fb9475b"
+      }
+    ]
+  }
+}

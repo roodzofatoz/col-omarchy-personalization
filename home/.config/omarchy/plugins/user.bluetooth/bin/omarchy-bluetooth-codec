@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""Codec control for Bluetooth A2DP devices, for the user.bluetooth bar plugin.
+
+PipeWire exposes every A2DP codec a connected device offers as a switchable
+option on the device's bluez card (pactl's `switch-codec` message), and the
+LDAC codec additionally exposes a live quality/bitrate knob on the sink node
+(`quality` in the node's Props). This script wraps both and prints JSON so the
+QML side never parses free text.
+
+Usage:
+  omarchy-bluetooth-codec status  <address>
+  omarchy-bluetooth-codec switch  <address> <codec-name>      # name from status.codecs[].name
+  omarchy-bluetooth-codec quality <address> <auto|hq|sq|mq>
+  omarchy-bluetooth-codec prefer  <address> [ldac-quality]    # best hi-res codec offered
+
+`prefer` is idempotent: it waits for the card to show up (a freshly connected
+device takes a moment), switches only when a better hi-res codec is offered
+than the one in use, and applies the LDAC quality only when it differs.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+# Short trace of every invocation (args, outcome) — the QML side runs this
+# detached, so this is the only place to see what happened on connect.
+LOG = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "omarchy-bluetooth-codec.log")
+
+
+def log(message):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 200_000:
+            os.replace(LOG, LOG + ".1")
+        with open(LOG, "a") as fh:
+            fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") + message + "\n")
+    except OSError:
+        pass
+
+# PipeWire codec ids considered hi-res (>= 24-bit / ~600 kbps class links).
+HIRES = {"ldac", "aptx_hd", "aptx_ad", "lc3plus_hr", "opus_05_pro"}
+
+# Higher is better when picking a codec automatically.
+RANK = {
+    "ldac": 100, "aptx_hd": 90, "aptx_ad": 85, "lc3plus_hr": 80, "opus_05_pro": 75,
+    "opus_05": 60, "opus_g": 55, "aptx": 50, "aac": 40, "sbc_xq": 30,
+    "aptx_ll": 25, "faststream": 20, "sbc": 10,
+}
+
+# pactl list-codecs gives the human description; PipeWire's node property
+# api.bluez5.codec gives the id. Map description -> id for the ones that don't
+# normalise trivially.
+LABEL_TO_ID = {
+    "sbc": "sbc", "sbc-xq": "sbc_xq", "aac": "aac", "aac-eld": "aac_eld",
+    "aptx": "aptx", "aptx hd": "aptx_hd", "aptx-ll": "aptx_ll",
+    "aptx-ll msbc": "aptx_ll_duplex", "aptx adaptive": "aptx_ad",
+    "faststream": "faststream", "faststream duplex sbc": "faststream_duplex",
+    "ldac": "ldac", "lc3plus hr": "lc3plus_hr", "lc3": "lc3",
+    "opus": "opus_g", "opus 05": "opus_05", "opus 05 pro audio": "opus_05_pro",
+    "opus 05 duplex": "opus_05_duplex", "opus 05 5.1 surround": "opus_05_51",
+    "opus 05 7.1 surround": "opus_05_71",
+}
+
+QUALITY_LABELS = {-1: "auto", 0: "hq", 1: "sq", 2: "mq"}
+QUALITY_VALUES = {v: k for k, v in QUALITY_LABELS.items()}
+
+
+def codec_id(label):
+    key = str(label or "").strip().lower()
+    if key in LABEL_TO_ID:
+        return LABEL_TO_ID[key]
+    return re.sub(r"[^a-z0-9]+", "_", key).strip("_")
+
+
+def card_name(address):
+    return "bluez_card." + address.strip().upper().replace(":", "_")
+
+
+def run(cmd, timeout=10):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(cmd, 1, "", str(exc))
+
+
+def pw_dump(ident=None):
+    cmd = ["pw-dump"] + ([str(ident)] if ident is not None else [])
+    res = run(cmd)
+    if res.returncode != 0 or not res.stdout.strip():
+        return []
+    try:
+        return json.loads(res.stdout)
+    except ValueError:
+        return []
+
+
+def props_of(obj):
+    return ((obj.get("info") or {}).get("props") or {})
+
+
+def params_of(obj):
+    return ((obj.get("info") or {}).get("params") or {})
+
+
+def find_card(dump, card):
+    for obj in dump:
+        if str(obj.get("type", "")).endswith(":Device") and props_of(obj).get("device.name") == card:
+            return obj
+    return None
+
+
+def find_sink(dump, card_obj):
+    if not card_obj:
+        return None
+    for obj in dump:
+        if not str(obj.get("type", "")).endswith(":Node"):
+            continue
+        props = props_of(obj)
+        if props.get("device.id") == card_obj.get("id") and props.get("media.class") == "Audio/Sink":
+            return obj
+    return None
+
+
+def list_codecs(card):
+    res = run(["pactl", "send-message", "/card/%s/bluez" % card, "list-codecs"])
+    if res.returncode != 0 or not res.stdout.strip():
+        return []
+    try:
+        raw = json.loads(res.stdout)
+    except ValueError:
+        return []
+    codecs = []
+    for entry in raw if isinstance(raw, list) else []:
+        label = str(entry.get("description") or entry.get("name") or "")
+        cid = codec_id(label)
+        codecs.append({
+            "name": str(entry.get("name", "")),
+            "label": label,
+            "id": cid,
+            "hires": cid in HIRES,
+            "rank": RANK.get(cid, 0),
+        })
+    return codecs
+
+
+def quality_of(sink):
+    """(hasQuality, value) from the sink node's Props / PropInfo params."""
+    if not sink:
+        return False, None
+    params = params_of(sink)
+    has = any(str(p.get("id")) == "quality" for p in params.get("PropInfo", []) if isinstance(p, dict))
+    value = None
+    for p in params.get("Props", []):
+        if isinstance(p, dict) and "quality" in p:
+            value = p["quality"]
+    return has, value
+
+
+def status(address, dump=None):
+    card = card_name(address)
+    dump = dump if dump is not None else pw_dump()
+    card_obj = find_card(dump, card)
+    result = {
+        "address": address,
+        "card": card if card_obj else None,
+        "cardId": card_obj.get("id") if card_obj else None,
+        "nodeId": None,
+        "profile": "",
+        "active": "",
+        "activeName": "",
+        "activeLabel": "",
+        "activeHires": False,
+        "codecs": [],
+        "hasQuality": False,
+        "quality": None,
+        "qualityLabel": "",
+    }
+    if not card_obj:
+        result["error"] = "no-card"
+        return result
+
+    sink = find_sink(dump, card_obj)
+    sink_props = props_of(sink) if sink else {}
+    codecs = list_codecs(card)
+    active = str(sink_props.get("api.bluez5.codec") or "")
+    if not active:
+        for p in params_of(card_obj).get("Props", []):
+            if isinstance(p, dict) and p.get("bluetoothAudioCodec"):
+                active = str(p["bluetoothAudioCodec"])
+    result.update({
+        "nodeId": sink.get("id") if sink else None,
+        "profile": str(sink_props.get("api.bluez5.profile") or ""),
+        "active": active,
+        "activeHires": active in HIRES,
+        "codecs": codecs,
+    })
+    for c in codecs:
+        if c["id"] == active:
+            result["activeName"] = c["name"]
+            result["activeLabel"] = c["label"]
+            break
+    has_quality, value = quality_of(sink)
+    result["hasQuality"] = bool(has_quality)
+    if has_quality and value is not None:
+        result["quality"] = value
+        result["qualityLabel"] = QUALITY_LABELS.get(int(value), str(value))
+    return result
+
+
+def emit(obj, code=0):
+    log("%s -> active=%s quality=%s%s" % (
+        " ".join(sys.argv[1:]), obj.get("active") or "-", obj.get("qualityLabel") or "-",
+        (" error=" + obj["error"]) if obj.get("error") else ""))
+    print(json.dumps(obj))
+    sys.exit(code)
+
+
+def wait_for(address, predicate, timeout, step=0.5):
+    deadline = time.monotonic() + timeout
+    st = status(address)
+    while not predicate(st) and time.monotonic() < deadline:
+        time.sleep(step)
+        st = status(address)
+    return st
+
+
+def do_switch(address, name, wait=6.0):
+    card = card_name(address)
+    res = run(["pactl", "send-message", "/card/%s/bluez" % card, "switch-codec", json.dumps(str(name))])
+    if res.returncode != 0:
+        st = status(address)
+        st["error"] = "switch-failed: " + (res.stderr.strip() or res.stdout.strip())
+        return st, False
+    st = wait_for(address, lambda s: s.get("activeName") == str(name), wait)
+    return st, st.get("activeName") == str(name)
+
+
+def do_quality(address, label, wait=3.0):
+    label = str(label).strip().lower()
+    if label not in QUALITY_VALUES:
+        st = status(address)
+        st["error"] = "bad-quality: " + label
+        return st, False
+    st = status(address)
+    if not st.get("hasQuality") or st.get("nodeId") is None:
+        st["error"] = "no-quality-knob"
+        return st, False
+    if st.get("qualityLabel") == label:
+        return st, True
+    res = run(["pw-cli", "set-param", str(st["nodeId"]), "Props", "{ quality = %d }" % QUALITY_VALUES[label]])
+    if res.returncode != 0:
+        st["error"] = "quality-failed: " + (res.stderr.strip() or res.stdout.strip())
+        return st, False
+    st = wait_for(address, lambda s: s.get("qualityLabel") == label, wait, step=0.25)
+    return st, st.get("qualityLabel") == label
+
+
+def do_prefer(address, quality=None):
+    # A device that just connected needs a moment before its card, codec list
+    # and sink node exist; a device without A2DP (headset-only) never grows
+    # them. Waiting for the sink too matters: a switch-codec sent while the
+    # transport is still being set up is refused.
+    st = wait_for(address, lambda s: s.get("card") and s.get("codecs") and s.get("nodeId") is not None, 15.0)
+    if not st.get("card") or not st.get("codecs"):
+        st["error"] = st.get("error") or "no-codecs"
+        emit(st)
+
+    hires = [c for c in st["codecs"] if c["hires"]]
+    if hires:
+        best = max(hires, key=lambda c: c["rank"])
+        current_rank = RANK.get(st.get("active", ""), 0)
+        if st.get("active") != best["id"] and best["rank"] > current_rank:
+            ok = False
+            for attempt in range(4):
+                st, ok = do_switch(address, best["name"])
+                if ok:
+                    break
+                log("prefer %s: switch to %s refused (attempt %d): %s" % (address, best["id"], attempt + 1, st.get("error", "not-applied")))
+                time.sleep(1.5)
+            if not ok:
+                emit(st)
+            st["switched"] = best["id"]
+
+    if quality and st.get("active") == "ldac":
+        # The quality knob lives on the sink node, which is recreated on a codec
+        # switch; give it a moment to come back before poking it.
+        st = wait_for(address, lambda s: s.get("hasQuality"), 4.0, step=0.25)
+        if st.get("hasQuality"):
+            st, _ = do_quality(address, quality)
+    emit(st)
+
+
+def main(argv):
+    if len(argv) < 3:
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(2)
+    cmd, address = argv[1], argv[2]
+    if cmd == "status":
+        emit(status(address))
+    if cmd == "switch":
+        if len(argv) < 4:
+            emit({"address": address, "error": "missing codec name"}, 2)
+        st, ok = do_switch(address, argv[3])
+        emit(st, 0 if ok else 1)
+    if cmd == "quality":
+        if len(argv) < 4:
+            emit({"address": address, "error": "missing quality"}, 2)
+        st, ok = do_quality(address, argv[3])
+        emit(st, 0 if ok else 1)
+    if cmd == "prefer":
+        do_prefer(address, argv[3] if len(argv) > 3 and argv[3] else None)
+    print(__doc__.strip(), file=sys.stderr)
+    sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

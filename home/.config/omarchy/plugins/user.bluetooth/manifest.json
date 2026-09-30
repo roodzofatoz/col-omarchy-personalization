@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "id": "user.bluetooth",
+  "name": "Bluetooth (hi-res codecs)",
+  "version": "1.1.0",
+  "author": "user",
+  "description": "Bluetooth device list with connect/disconnect, plus a per-device A2DP codec picker (LDAC, aptX HD, \u2026) with LDAC quality control and automatic hi-res preference",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Bluetooth (hi-res codecs)",
+    "description": "Bluetooth device list with connect/disconnect, plus a per-device A2DP codec picker (LDAC, aptX HD, \u2026) with LDAC quality control and automatic hi-res preference",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaults": {
+      "preferHiRes": true,
+      "ldacQuality": "auto",
+      "showCodecPicker": true
+    },
+    "schema": [
+      {
+        "key": "preferHiRes",
+        "type": "boolean",
+        "label": "Prefer hi-res codec on connect",
+        "defaultValue": true,
+        "description": "When a device connects, switch it to the best hi-res codec it offers (LDAC, aptX HD, aptX Adaptive, LC3plus HR) if PipeWire picked a lesser one."
+      },
+      {
+        "key": "ldacQuality",
+        "type": "enum",
+        "label": "LDAC quality applied on connect",
+        "options": [
+          "auto",
+          "hq",
+          "sq",
+          "mq"
+        ],
+        "defaultValue": "auto",
+        "description": "auto = adaptive bitrate (PipeWire default); hq = 990/909 kbps; sq = 660/606 kbps; mq = 330/303 kbps. hq is true hi-res but may stutter on a crowded 2.4 GHz link."
+      },
+      {
+        "key": "showCodecPicker",
+        "type": "boolean",
+        "label": "Show codec chips under connected devices",
+        "defaultValue": true
+      }
+    ]
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.bluetooth"
+  }
+}
